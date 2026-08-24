@@ -22,7 +22,10 @@ import { pathToFileURL } from 'node:url'
 const require = createRequire(import.meta.url)
 const bin = require.resolve('@deepseek-ai/dsh/lib/bin.js')
 
-const args = ['web', '--port', process.env.DSH_DESKTOP_PORT ?? '0']
+// --no-open: the desktop WebView navigates to the URL itself; opening the
+// system browser too would spawn a stray tab on every launch (dsh >= 0.1.1
+// opens one by default).
+const args = ['web', '--port', process.env.DSH_DESKTOP_PORT ?? '0', '--no-open']
 if (process.env.DSH_DESKTOP_TRUSTED_HOSTS !== undefined) {
   for (const entry of process.env.DSH_DESKTOP_TRUSTED_HOSTS.split(',')) {
     if (entry.trim() !== '') args.push('--trusted-host', entry.trim())

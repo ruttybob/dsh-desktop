@@ -14,7 +14,7 @@ allowBuilds:
   node-pty: true
   protobufjs: true
 
-# The dsh family is published together at rc.6 (2026-08-13); the default
+# The dsh family is published together (0.1.1 line, 2026-08-21); the default
 # minimum-release-age supply-chain gate would reject every one of them. They
 # are the very packages this app wraps, so the age gate is disabled.
 minimumReleaseAge: 0
