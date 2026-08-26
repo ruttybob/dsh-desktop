@@ -208,6 +208,7 @@ Releases（草稿，确认无误后手动转正式版）。
 | 长时间停留在闪屏页 | 查看应用日志定位主机启动失败原因 |
 | 主机启动报错 | 日志：Windows `%LOCALAPPDATA%\com.dsh.desktop\logs\dsh-desktop.log`，macOS/Linux 见 `~/Library/Logs` 与 `~/.local/share/com.dsh.desktop/logs` |
 | 模型无响应 | 检查 设置 → 模型 中的 API Key 与模型配置 |
+| 应用内看不到终端里的 CLI（如 `bd`） | GUI 启动继承的是 launchd 的四目录桩 `PATH`；主机启动时已通过登录 shell 探测并恢复用户的 `PATH`。若个别 CLI 仍缺失，确认它位于登录 shell 的 `PATH` 中，且其 profile 脚本未阻塞超过 5 秒 |
 | 构建时提示 host bundle missing | 先执行 `npm run host:bundle`（`build.rs` 会主动报错提示） |
 
 ## ⚠️ 已知限制

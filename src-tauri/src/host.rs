@@ -28,11 +28,24 @@ impl HostManager {
         let Some(host_dir) = host_dirs.iter().find(|dir| dir.join("main.mjs").exists()) else {
             log::error!(
                 "[host] bundled host missing under any of: {}",
-                host_dirs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+                host_dirs
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
-            return Self { child: Mutex::new(None) };
+            return Self {
+                child: Mutex::new(None),
+            };
         };
-        let node = strip_verbatim_prefix(host_node_binary(host_dir));
+        // A GUI launch sees launchd's stub PATH; restore the login shell's
+        // PATH first so both the bare-node fallback and the spawned host see
+        // the user's own CLI locations (Homebrew, nvm, ~/.local/bin).
+        let restored_path = restore_login_shell_path();
+        let node = strip_verbatim_prefix(match host_node_binary(host_dir) {
+            Some(bundled) => bundled,
+            None => bare_node_from(restored_path.as_deref()),
+        });
         let entry = strip_verbatim_prefix(host_dir.join("main.mjs"));
         let workspace = ensure_workspace_dir();
         log::info!(
@@ -49,6 +62,9 @@ impl HostManager {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(path) = restored_path {
+            cmd.env("PATH", path);
+        }
         // No console window on Windows (WebView2 app shell).
         #[cfg(windows)]
         {
@@ -69,12 +85,16 @@ impl HostManager {
             Ok(child) => child,
             Err(error) => {
                 log::error!("[host] failed to spawn {node:?} main.mjs: {error}");
-                return Self { child: Mutex::new(None) };
+                return Self {
+                    child: Mutex::new(None),
+                };
             }
         };
         let stdout = child.stdout.take().expect("piped host stdout");
         let stderr = child.stderr.take().expect("piped host stderr");
-        let manager = Self { child: Mutex::new(Some(child)) };
+        let manager = Self {
+            child: Mutex::new(Some(child)),
+        };
 
         // stderr reader: forward everything (harness logs, boot errors).
         thread::spawn(move || {
@@ -128,22 +148,158 @@ fn resolve_host_dirs(app: &AppHandle) -> Vec<PathBuf> {
         dirs.push(resource_dir.join("resources").join("host"));
     }
     // Dev fallback: the checkout's assembled resources (npm run host:bundle).
-    dirs.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources").join("host"));
+    dirs.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join("host"),
+    );
     dirs
 }
 
-/// The bundled Node binary, or a fallback to `node` on PATH (dev convenience).
-fn host_node_binary(host_dir: &Path) -> PathBuf {
+/// The bundled Node binary, or `None` to resolve bare `node` against the
+/// restored login PATH (dev convenience; release builds always bundle).
+fn host_node_binary(host_dir: &Path) -> Option<PathBuf> {
     let bundled = if cfg!(windows) {
         host_dir.join("node").join("node.exe")
     } else {
         host_dir.join("node").join("bin").join("node")
     };
-    if bundled.exists() {
-        bundled
-    } else {
-        PathBuf::from("node")
+    bundled.exists().then_some(bundled)
+}
+
+// ── login-shell environment restoration ─────────────────────────────────────
+//
+// A macOS GUI launch inherits launchd's four-directory stub PATH
+// (/usr/bin:/bin:/usr/sbin:/sbin): Homebrew, nvm, and home-local binaries —
+// `bd` among them — stay invisible to the host process and every session
+// shell beneath it. Before spawning the sidecar we ask the user's login
+// shell to evaluate its profile scripts and print its PATH (the VS Code
+// approach); on any failure the ambient environment is kept, so the app
+// never boots slower than the probe budget below.
+
+/// How long the login-shell PATH probe may run before the ambient PATH wins:
+/// a wedged profile script must not stall app boot.
+#[cfg(unix)]
+const SHELL_PATH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Upper bound of accepted probe output. Real PATH values sit far below this;
+/// more means a misbehaving profile, not a longer PATH.
+#[cfg(unix)]
+const SHELL_PATH_MAX_OUTPUT_BYTES: u64 = 64 * 1024;
+
+/// Marker wrapping the probe payload so profile startup noise cannot corrupt
+/// the parsed value.
+#[cfg(unix)]
+const SHELL_PATH_MARKER: &str = "__DSH_PATH__";
+
+/// Restore the user's login-shell `PATH` by running `<SHELL> -ilc 'printf …'`.
+///
+/// Returns `None` when `SHELL` is unset, the shell cannot be spawned, or the
+/// probe times out, fails, or yields nothing usable — every failure keeps the
+/// inherited environment rather than blocking launch.
+#[cfg(unix)]
+fn restore_login_shell_path() -> Option<String> {
+    let shell = PathBuf::from(std::env::var_os("SHELL")?);
+    use std::time::{Duration, Instant};
+    let mut child = Command::new(&shell)
+        .args(["-ilc", &format!("printf '{SHELL_PATH_MARKER}%s' \"$PATH\"")])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .spawn()
+        .inspect_err(|error| log::warn!("[host] PATH probe via {shell:?} failed to start: {error}"))
+        .ok()?;
+    let deadline = Instant::now() + SHELL_PATH_PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                log::warn!(
+                    "[host] PATH probe via {shell:?} exceeded {} ms; keeping ambient PATH",
+                    SHELL_PATH_PROBE_TIMEOUT.as_millis(),
+                );
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(25)),
+            Err(error) => {
+                log::warn!("[host] PATH probe wait failed: {error}; keeping ambient PATH");
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
     }
+    // Drain only after exit so an over-printing profile cannot wedge us on a
+    // full pipe: the wait above stays deadline-bounded either way, and a pipe
+    // holds everything buffered until this read.
+    use std::io::Read as _;
+    let mut captured = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        let _ = stdout
+            .take(SHELL_PATH_MAX_OUTPUT_BYTES)
+            .read_to_end(&mut captured);
+    }
+    let path = extract_probe_path(&String::from_utf8_lossy(&captured))?;
+    log::info!(
+        "[host] restored login-shell PATH ({} entries)",
+        path.split(':').count()
+    );
+    Some(path)
+}
+
+/// Non-Unix platforms keep the inherited environment.
+#[cfg(not(unix))]
+fn restore_login_shell_path() -> Option<String> {
+    None
+}
+
+/// Parse `"<marker><path>"` out of whatever else a profile printed. One
+/// trailing newline is stripped, interior whitespace is preserved, and the
+/// value must carry at least two colon-separated entries.
+#[cfg(unix)]
+fn extract_probe_path(payload: &str) -> Option<String> {
+    let start = payload.find(SHELL_PATH_MARKER)? + SHELL_PATH_MARKER.len();
+    let remainder = &payload[start..];
+    let end = remainder.find(['\r', '\n']).unwrap_or(remainder.len());
+    let value = remainder[..end].trim();
+    (!value.is_empty() && value.contains(':')).then(|| value.to_string())
+}
+
+/// Bare `node`: searched along the restored login PATH when available;
+/// otherwise the bare-name fallback keeps dev checkouts working through the
+/// ambient lookup (a GUI launch resolves it only if the stub PATH covers it).
+#[cfg(unix)]
+fn bare_node_from(restored_path: Option<&str>) -> PathBuf {
+    restored_path
+        .and_then(|value| resolve_in_path(value, "node"))
+        .unwrap_or_else(|| PathBuf::from("node"))
+}
+
+#[cfg(not(unix))]
+fn bare_node_from(_restored_path: Option<&str>) -> PathBuf {
+    PathBuf::from("node")
+}
+
+/// Locate `binary` along a concrete PATH value: `Command`'s own program lookup
+/// searches this process's PATH, which a GUI launch leaves launchd-stubbed —
+/// the restored value must be walked explicitly.
+#[cfg(unix)]
+fn resolve_in_path(path_value: &str, binary: &str) -> Option<PathBuf> {
+    path_value
+        .split(':')
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| Path::new(entry).join(binary))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(path)
+        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
 }
 
 /// Tauri returns resource paths with the Windows extended-length prefix
@@ -189,6 +345,113 @@ fn parse_url_line(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::parse_url_line;
+
+    #[cfg(unix)]
+    mod shell_path {
+        use super::super::{extract_probe_path, resolve_in_path};
+        use std::path::{Path, PathBuf};
+
+        /// A unique scratch root that cleans itself up, safe under parallel runs.
+        struct Scratch(PathBuf);
+
+        impl Scratch {
+            fn new(tag: &str) -> Self {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_nanos())
+                    .unwrap_or_default();
+                let dir = std::env::temp_dir().join(format!(
+                    "dsh-desktop-host-{tag}-{}-{nanos}",
+                    std::process::id(),
+                ));
+                std::fs::create_dir_all(&dir).expect("create scratch root");
+                Self(dir)
+            }
+        }
+
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        /// Materialize `path` as an executable file.
+        fn executable_file(path: &Path) {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(path, "#!/bin/sh\n").expect("write fixture script");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fixture script");
+        }
+
+        #[test]
+        fn extracts_the_path_past_profile_startup_noise() {
+            let payload = "Last login: Fri Aug 26 on ttys000\nloading nvm...\n\
+                 __DSH_PATH__/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/me/.local/bin";
+            assert_eq!(
+                extract_probe_path(payload),
+                Some(
+                    "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/me/.local/bin"
+                        .to_string()
+                ),
+            );
+        }
+
+        #[test]
+        fn strips_a_single_trailing_newline_after_the_path() {
+            assert_eq!(
+                extract_probe_path("__DSH_PATH__/bin:/usr/bin\n"),
+                Some("/bin:/usr/bin".to_string()),
+            );
+        }
+
+        #[test]
+        fn rejects_missing_empty_or_componentless_probe_payloads() {
+            assert_eq!(extract_probe_path("profile printed nothing useful"), None);
+            assert_eq!(extract_probe_path("__DSH_PATH__"), None);
+            assert_eq!(extract_probe_path("__DSH_PATH__   \n"), None);
+            assert_eq!(extract_probe_path("__DSH_PATH__/only-one-directory"), None);
+        }
+
+        #[test]
+        fn resolves_the_binary_through_path_order() {
+            let scratch = Scratch::new("resolve-order");
+            let earlier = scratch.0.join("earlier");
+            let later = scratch.0.join("later");
+            std::fs::create_dir_all(&earlier).expect("mkdir earlier");
+            std::fs::create_dir_all(&later).expect("mkdir later");
+            executable_file(&later.join("bd"));
+            let path_value = format!("{}:{}", earlier.display(), later.display());
+            assert_eq!(resolve_in_path(&path_value, "bd"), Some(later.join("bd")));
+        }
+
+        #[test]
+        fn skips_non_executable_files_directory_decoys_and_misses() {
+            let scratch = Scratch::new("resolve-skip");
+            let plain_only = scratch.0.join("plain-only");
+            let decoy_dirs = scratch.0.join("decoy-dirs");
+            let carries_it = scratch.0.join("carries-it");
+            std::fs::create_dir_all(&plain_only).expect("mkdir plain-only");
+            std::fs::create_dir_all(decoy_dirs.join("bd")).expect("mkdir directory decoy");
+            std::fs::create_dir_all(&carries_it).expect("mkdir carries-it");
+            std::fs::write(plain_only.join("bd"), "not executable").expect("write plain file");
+            executable_file(&carries_it.join("bd"));
+            let path_value = format!(
+                "{}:{}:{}",
+                plain_only.display(),
+                decoy_dirs.display(),
+                carries_it.display()
+            );
+            assert_eq!(
+                resolve_in_path(&path_value, "bd"),
+                Some(carries_it.join("bd")),
+                "a non-executable file and a same-named directory must not win over PATH order",
+            );
+            assert_eq!(
+                resolve_in_path(&plain_only.display().to_string(), "absent"),
+                None
+            );
+        }
+    }
 
     #[test]
     fn parses_the_url_line() {
