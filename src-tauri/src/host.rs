@@ -44,7 +44,7 @@ impl HostManager {
         let restored_path = restore_login_shell_path();
         let node = strip_verbatim_prefix(match host_node_binary(host_dir) {
             Some(bundled) => bundled,
-            None => bare_node_from(restored_path.as_deref()),
+            None => fallback_node_binary(restored_path.as_deref()),
         });
         let entry = strip_verbatim_prefix(host_dir.join("main.mjs"));
         let workspace = ensure_workspace_dir();
@@ -218,22 +218,21 @@ fn restore_login_shell_path() -> Option<String> {
                     "[host] PATH probe via {shell:?} exceeded {} ms; keeping ambient PATH",
                     SHELL_PATH_PROBE_TIMEOUT.as_millis(),
                 );
-                let _ = child.kill();
-                let _ = child.wait();
+                reap_probe_child(&mut child);
                 return None;
             }
             Ok(None) => thread::sleep(Duration::from_millis(25)),
             Err(error) => {
                 log::warn!("[host] PATH probe wait failed: {error}; keeping ambient PATH");
-                let _ = child.kill();
-                let _ = child.wait();
+                reap_probe_child(&mut child);
                 return None;
             }
         }
     }
-    // Drain only after exit so an over-printing profile cannot wedge us on a
-    // full pipe: the wait above stays deadline-bounded either way, and a pipe
-    // holds everything buffered until this read.
+    // Drain only after the shell has exited. A profile that prints more than
+    // one pipe capacity before exiting blocks on write instead of exiting,
+    // trips the deadline above, and is killed — losing its PATH, which is the
+    // accepted degradation: real payloads sit far below one pipe buffer.
     use std::io::Read as _;
     let mut captured = Vec::new();
     if let Some(stdout) = child.stdout.take() {
@@ -255,6 +254,13 @@ fn restore_login_shell_path() -> Option<String> {
     None
 }
 
+/// Kill and reap a wedged or failed probe shell so no child is left behind.
+#[cfg(unix)]
+fn reap_probe_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Parse `"<marker><path>"` out of whatever else a profile printed. One
 /// trailing newline is stripped, interior whitespace is preserved, and the
 /// value must carry at least two colon-separated entries.
@@ -267,18 +273,19 @@ fn extract_probe_path(payload: &str) -> Option<String> {
     (!value.is_empty() && value.contains(':')).then(|| value.to_string())
 }
 
-/// Bare `node`: searched along the restored login PATH when available;
-/// otherwise the bare-name fallback keeps dev checkouts working through the
-/// ambient lookup (a GUI launch resolves it only if the stub PATH covers it).
+/// The `node` binary used when no runtime is bundled: searched along the
+/// restored login PATH when available; otherwise the bare name keeps dev
+/// checkouts working through the ambient lookup (a GUI launch resolves it
+/// only if the stub PATH covers it).
 #[cfg(unix)]
-fn bare_node_from(restored_path: Option<&str>) -> PathBuf {
+fn fallback_node_binary(restored_path: Option<&str>) -> PathBuf {
     restored_path
         .and_then(|value| resolve_in_path(value, "node"))
         .unwrap_or_else(|| PathBuf::from("node"))
 }
 
 #[cfg(not(unix))]
-fn bare_node_from(_restored_path: Option<&str>) -> PathBuf {
+fn fallback_node_binary(_restored_path: Option<&str>) -> PathBuf {
     PathBuf::from("node")
 }
 
