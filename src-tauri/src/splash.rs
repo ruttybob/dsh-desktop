@@ -67,7 +67,10 @@ pub fn read_remembered_url() -> Option<String> {
                 None
             }
             Err(error) => {
-                log::warn!("[splash] corrupt remembered-server file {}: {error}", path.display());
+                log::warn!(
+                    "[splash] corrupt remembered-server file {}: {error}",
+                    path.display()
+                );
                 None
             }
         },
@@ -113,7 +116,11 @@ fn validate_attach_url(input: &str) -> Result<Url, String> {
     let url = Url::parse(trimmed).map_err(|error| format!("invalid URL: {error}"))?;
     match url.scheme() {
         "http" | "https" => {}
-        other => return Err(format!("unsupported scheme {other:?}: only http/https are allowed")),
+        other => {
+            return Err(format!(
+                "unsupported scheme {other:?}: only http/https are allowed"
+            ))
+        }
     }
     // Reject scheme-less input that Url::parse salvages as a path
     // (e.g. "127.0.0.1:3080" parses as scheme "127.0.0.1").
@@ -125,7 +132,9 @@ fn validate_attach_url(input: &str) -> Result<Url, String> {
 
 /// True when the URL points at loopback, where the server does not need
 /// `--trusted-host` (the splash hint is shown for every other host).
-fn is_loopback_url(url: &Url) -> bool {
+/// `pub(crate)`: the unreachable-stub probe (dsh-cxq) reuses the same rule
+/// for its diagnostics hint.
+pub(crate) fn is_loopback_url(url: &Url) -> bool {
     match url.host() {
         Some(url::Host::Domain(host)) => host == "localhost",
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
@@ -159,6 +168,7 @@ pub fn splash_forget() -> Result<(), String> {
 /// stored entry, so the checkbox state is the whole truth after every connect.
 #[tauri::command]
 pub fn splash_connect(
+    app: tauri::AppHandle,
     window: WebviewWindow,
     url: String,
     remember: bool,
@@ -184,7 +194,13 @@ pub fn splash_connect(
             ""
         }
     );
-    window.navigate(url).map_err(|error| format!("navigate failed: {error}"))
+    // A splash connect points the window at an external server: start
+    // unreachable-probing for it (dsh-cxq). The guard inside start_monitor is
+    // a no-op in Sidecar mode, where the HostManager owns the window target.
+    crate::stub::start_monitor(app, url.clone());
+    window
+        .navigate(url)
+        .map_err(|error| format!("navigate failed: {error}"))
 }
 
 #[cfg(test)]
@@ -211,7 +227,9 @@ mod tests {
     #[test]
     fn validate_accepts_http_and_https() {
         assert_eq!(
-            validate_attach_url("http://127.0.0.1:3080").unwrap().to_string(),
+            validate_attach_url("http://127.0.0.1:3080")
+                .unwrap()
+                .to_string(),
             "http://127.0.0.1:3080/"
         );
         assert!(validate_attach_url("  https://dsh.example.com  ").is_ok());
@@ -228,15 +246,24 @@ mod tests {
             "",
             "   ",
         ] {
-            assert!(validate_attach_url(bad).is_err(), "expected reject: {bad:?}");
+            assert!(
+                validate_attach_url(bad).is_err(),
+                "expected reject: {bad:?}"
+            );
         }
     }
 
     #[test]
     fn loopback_detection() {
-        assert!(is_loopback_url(&validate_attach_url("http://127.0.0.1:3080").unwrap()));
-        assert!(is_loopback_url(&validate_attach_url("http://localhost:3080").unwrap()));
-        assert!(is_loopback_url(&validate_attach_url("http://[::1]:3080").unwrap()));
+        assert!(is_loopback_url(
+            &validate_attach_url("http://127.0.0.1:3080").unwrap()
+        ));
+        assert!(is_loopback_url(
+            &validate_attach_url("http://localhost:3080").unwrap()
+        ));
+        assert!(is_loopback_url(
+            &validate_attach_url("http://[::1]:3080").unwrap()
+        ));
         assert!(!is_loopback_url(
             &validate_attach_url("http://192.168.1.10:3080").unwrap()
         ));
@@ -283,12 +310,22 @@ mod tests {
         assert_eq!(read_remembered_url(), None);
 
         // Valid entry survives and comes back normalized.
-        std::fs::write(&path, format!(r#"{{"version":{STORE_VERSION},"url":"http://127.0.0.1:3080"}}"#))
-            .unwrap();
-        assert_eq!(read_remembered_url().as_deref(), Some("http://127.0.0.1:3080/"));
+        std::fs::write(
+            &path,
+            format!(r#"{{"version":{STORE_VERSION},"url":"http://127.0.0.1:3080"}}"#),
+        )
+        .unwrap();
+        assert_eq!(
+            read_remembered_url().as_deref(),
+            Some("http://127.0.0.1:3080/")
+        );
 
         // Stored URL that no longer validates (e.g. file edited by hand) -> None.
-        std::fs::write(&path, format!(r#"{{"version":{STORE_VERSION},"url":"ftp://x"}}"#)).unwrap();
+        std::fs::write(
+            &path,
+            format!(r#"{{"version":{STORE_VERSION},"url":"ftp://x"}}"#),
+        )
+        .unwrap();
         assert_eq!(read_remembered_url(), None);
 
         std::env::remove_var("DSH_HOME");

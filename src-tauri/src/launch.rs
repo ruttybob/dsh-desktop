@@ -78,8 +78,10 @@ pub fn resolve_launch_mode(env_value: Option<&str>, args: &[String]) -> LaunchMo
     match parse_attach_arg(args) {
         Some(Ok(url)) => LaunchMode::Attach { url },
         Some(Err(error)) => {
-            log::error!("[launch] invalid {ATTACH_URL_FLAG} argument: {error}; \
-                         falling back to sidecar launch");
+            log::error!(
+                "[launch] invalid {ATTACH_URL_FLAG} argument: {error}; \
+                         falling back to sidecar launch"
+            );
             LaunchMode::Sidecar
         }
         None => LaunchMode::Sidecar,
@@ -200,7 +202,10 @@ mod tests {
 
     #[test]
     fn treats_a_whitespace_only_env_value_as_no_signal() {
-        assert_eq!(resolve_launch_mode(Some("   "), &args(&[])), LaunchMode::Sidecar);
+        assert_eq!(
+            resolve_launch_mode(Some("   "), &args(&[])),
+            LaunchMode::Sidecar
+        );
         assert_eq!(
             resolve_launch_mode(Some("   "), &args(&["--attach-url", "http://h:1"])),
             attach("http://h:1"),
@@ -210,7 +215,12 @@ mod tests {
 
     #[test]
     fn rejects_invalid_or_non_http_env_values_into_sidecar() {
-        for bad in ["not a url", "ftp://127.0.0.1:3080", "file:///etc/passwd", "http://"] {
+        for bad in [
+            "not a url",
+            "ftp://127.0.0.1:3080",
+            "file:///etc/passwd",
+            "http://",
+        ] {
             assert_eq!(
                 resolve_launch_mode(Some(bad), &args(&[])),
                 LaunchMode::Sidecar,
@@ -271,7 +281,10 @@ mod tests {
     #[test]
     fn rejects_invalid_or_non_http_argv_values_into_sidecar() {
         for bad in ["--attach-url=javascript:alert(1)", "--attach-url=nope"] {
-            assert_eq!(resolve_launch_mode(None, &args(&[bad])), LaunchMode::Sidecar);
+            assert_eq!(
+                resolve_launch_mode(None, &args(&[bad])),
+                LaunchMode::Sidecar
+            );
         }
         assert_eq!(
             resolve_launch_mode(None, &args(&["--attach-url", "https://"])),
@@ -284,7 +297,12 @@ mod tests {
         assert_eq!(
             resolve_launch_mode(
                 None,
-                &args(&["--attach-url", "http://first:1", "--attach-url", "http://second:2"])
+                &args(&[
+                    "--attach-url",
+                    "http://first:1",
+                    "--attach-url",
+                    "http://second:2"
+                ])
             ),
             attach("http://first:1"),
         );
@@ -321,6 +339,9 @@ mod tests {
             super::resolve_relaunch_attach(&args(&["--attach-url=javascript:alert(1)"])),
             None,
         );
-        assert_eq!(super::resolve_relaunch_attach(&args(&["--attach-url"])), None);
+        assert_eq!(
+            super::resolve_relaunch_attach(&args(&["--attach-url"])),
+            None
+        );
     }
 }
