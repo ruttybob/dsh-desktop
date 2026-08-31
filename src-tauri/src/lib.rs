@@ -5,6 +5,7 @@
 mod host;
 mod launch;
 mod splash;
+mod stub;
 
 use tauri::Manager;
 
@@ -28,13 +29,18 @@ pub fn run() {
                 // than capturing it from setup.
                 match app.get_webview_window("main") {
                     Some(window) => {
-                        if let Err(error) = window.navigate(url) {
+                        if let Err(error) = window.navigate(url.clone()) {
                             log::error!("[single-instance] attach navigate failed: {error}");
                         }
+                        // The forwarded URL becomes the new monitored attach
+                        // target. start_monitor is a no-op when this instance
+                        // runs Sidecar mode (HostManager present), so a
+                        // sidecar window is never probed.
+                        stub::start_monitor(app.clone(), url);
                     }
-                    None => log::error!(
-                        "[single-instance] no main window yet; attach request dropped"
-                    ),
+                    None => {
+                        log::error!("[single-instance] no main window yet; attach request dropped")
+                    }
                 }
             }
         }))
@@ -44,8 +50,14 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             splash::splash_connect,
             splash::splash_get_remembered,
-            splash::splash_forget
+            splash::splash_forget,
+            stub::stub_retry,
+            stub::stub_quit,
+            stub::stub_diagnostics
         ])
+        // Managed on the Builder (before setup and before any single-instance
+        // callback) so every attach path can reach the shared probe state.
+        .manage(stub::ProbeMonitor::empty())
         .setup(|app| {
             let window = app
                 .get_webview_window("main")
@@ -60,6 +72,10 @@ pub fn run() {
             ) {
                 launch::LaunchMode::Attach { url } => {
                     log::info!("[launch] attach mode: navigating to {}", url.as_str());
+                    // Tauri/wry does not report navigation failures, so this
+                    // probe is the only detector for a dead initial attach:
+                    // on a dead verdict the window moves to the stub page.
+                    stub::start_monitor(app.handle().clone(), url.clone());
                     if let Err(error) = window.navigate(url) {
                         log::error!("[launch] attach navigate failed: {error}");
                     }

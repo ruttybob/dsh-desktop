@@ -348,9 +348,7 @@ fn parse_url_line(line: &str) -> Option<String> {
     let trimmed = line.trim();
     let start = trimmed.find(PREFIX)?;
     let rest = &trimmed[start + PREFIX.len()..];
-    let end = rest
-        .find(char::is_whitespace)
-        .unwrap_or(rest.len());
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
     let token = &rest[..end];
     let port: String = token.chars().take_while(|c| c.is_ascii_digit()).collect();
     if port.is_empty() {
@@ -497,7 +495,9 @@ mod tests {
         );
         // A trailing LAN suffix (whitespace delimiter) is left untouched.
         assert_eq!(
-            redact_token("dsh web: http://127.0.0.1:3080?token=abc123 (LAN: http://192.168.1.2:3080)"),
+            redact_token(
+                "dsh web: http://127.0.0.1:3080?token=abc123 (LAN: http://192.168.1.2:3080)"
+            ),
             "dsh web: http://127.0.0.1:3080?token=[redacted] (LAN: http://192.168.1.2:3080)"
         );
     }
@@ -563,8 +563,17 @@ mod tests {
         assert_eq!(parse_url_line("dsh web: http://127.0.0.1:"), None);
         // Non-loopback authorities are rejected, tokenized or not.
         assert_eq!(parse_url_line("dsh web: http://0.0.0.0:3080"), None);
-        assert_eq!(parse_url_line("dsh web: http://0.0.0.0:3080?token=abc"), None);
-        assert_eq!(parse_url_line("dsh web: http://192.168.1.2:3080?token=abc"), None);
-        assert_eq!(parse_url_line("dsh web: http://localhost:3080?token=abc"), None);
+        assert_eq!(
+            parse_url_line("dsh web: http://0.0.0.0:3080?token=abc"),
+            None
+        );
+        assert_eq!(
+            parse_url_line("dsh web: http://192.168.1.2:3080?token=abc"),
+            None
+        );
+        assert_eq!(
+            parse_url_line("dsh web: http://localhost:3080?token=abc"),
+            None
+        );
     }
 }
