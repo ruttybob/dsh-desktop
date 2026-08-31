@@ -1,6 +1,10 @@
-//! dsh-desktop shell: create the window (splash), spawn the Node host sidecar,
-//! navigate the WebView to the `dsh web:` loopback URL once the host reports
-//! readiness, and terminate the host when the app exits.
+//! dsh-desktop shell: create the window and connect it to a web UI. With an
+//! attach signal (env/argv) or a remembered server the window navigates
+//! straight to that server (probe-monitored); otherwise the splash connect
+//! form is shown. The classic sidecar spawn + `dsh web:` marker flow lives in
+//! host.rs and the loading page (ui/index.html) but no longer serves the
+//! no-signal launch (replaced by splash per dsh-df4); the host is terminated
+//! on exit when one is running.
 
 mod host;
 mod launch;
@@ -8,6 +12,19 @@ mod splash;
 mod stub;
 
 use tauri::Manager;
+
+/// Attach the main window to a server: start the unreachable-probe monitor
+/// first, navigate second. This is the shared wiring for every attach entry
+/// point (env/argv launch, remembered auto-connect, splash connect, and
+/// single-instance forwarding) — wry reports no navigation failures, so the
+/// probe is the only detector for a dead server.
+fn attach_to_server(app: &tauri::AppHandle, window: &tauri::WebviewWindow, url: tauri::Url) {
+    log::info!("[launch] attach mode: navigating to {}", url.as_str());
+    stub::start_monitor(app.clone(), url.clone());
+    if let Err(error) = window.navigate(url) {
+        log::error!("[launch] attach navigate failed: {error}");
+    }
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -24,20 +41,24 @@ pub fn run() {
             let args: Vec<String> = argv.to_vec();
             if let Some(url) = launch::resolve_relaunch_attach(&args) {
                 log::info!("[single-instance] forwarding attach to {url}",);
+                // The launch mode is fixed only at startup; forwarding may
+                // retarget an instance that launched in sidecar mode. Stop
+                // the sidecar first so the window detaches from it cleanly
+                // and probe monitoring is allowed to start (start_monitor
+                // refuses while a sidecar child is running).
+                if let Some(manager) = app.try_state::<host::HostManager>() {
+                    if manager.is_running() {
+                        log::info!(
+                            "[single-instance] stopping sidecar host before attach retarget"
+                        );
+                        manager.stop();
+                    }
+                }
                 // The main window may not exist yet when the callback fires
                 // during first-instance startup, so resolve it here rather
                 // than capturing it from setup.
                 match app.get_webview_window("main") {
-                    Some(window) => {
-                        if let Err(error) = window.navigate(url.clone()) {
-                            log::error!("[single-instance] attach navigate failed: {error}");
-                        }
-                        // The forwarded URL becomes the new monitored attach
-                        // target. start_monitor is a no-op when this instance
-                        // runs Sidecar mode (HostManager present), so a
-                        // sidecar window is never probed.
-                        stub::start_monitor(app.clone(), url);
-                    }
+                    Some(window) => attach_to_server(app, &window, url),
                     None => {
                         log::error!("[single-instance] no main window yet; attach request dropped")
                     }
@@ -62,28 +83,46 @@ pub fn run() {
             let window = app
                 .get_webview_window("main")
                 .expect("main webview window from tauri.conf.json");
-            // Attach Mode (DSH_DESKTOP_ATTACH_URL / --attach-url): navigate
-            // straight to an already running server and skip the sidecar
-            // entirely — no HostManager is managed, and the exit hook's
-            // try_state() below simply finds nothing to stop.
+            // Launch priority (dsh-nbe / dsh-df4), resolved here so the
+            // dsh-tfd resolver stays pure:
+            //   1. env/argv attach signal        → attach (no spawn),
+            //   2. remembered server (dsh-df4)   → attach (no spawn),
+            //   3. otherwise                     → splash connect form.
+            // The classic sidecar spawn therefore no longer serves the
+            // no-signal case — splash replaced it per dsh-df4 AC1 ("Splash
+            // без env/argv показывает форму"); the HostManager machinery in
+            // host.rs stays byte-identical and both the probe guard and the
+            // exit hook tolerate its absence. A sidecar can still come back
+            // under this window later only via a cleared splash state (the
+            // single-instance forwarding path above stops it explicitly).
             match launch::resolve_launch_mode(
                 std::env::var(launch::ATTACH_URL_ENV).ok().as_deref(),
                 &std::env::args().collect::<Vec<_>>(),
             ) {
                 launch::LaunchMode::Attach { url } => {
-                    log::info!("[launch] attach mode: navigating to {}", url.as_str());
-                    // Tauri/wry does not report navigation failures, so this
-                    // probe is the only detector for a dead initial attach:
-                    // on a dead verdict the window moves to the stub page.
-                    stub::start_monitor(app.handle().clone(), url.clone());
-                    if let Err(error) = window.navigate(url) {
-                        log::error!("[launch] attach navigate failed: {error}");
+                    attach_to_server(app.handle(), &window, url);
+                }
+                launch::LaunchMode::Sidecar => match splash::resolve_no_signal_action() {
+                    splash::NoSignalAction::Attach { url } => {
+                        log::info!("[launch] remembered server: attaching to {}", url.as_str());
+                        attach_to_server(app.handle(), &window, url);
                     }
-                }
-                launch::LaunchMode::Sidecar => {
-                    let manager = host::HostManager::spawn(app.handle().clone(), window);
-                    app.manage(manager);
-                }
+                    splash::NoSignalAction::ShowForm => {
+                        // The initial window URL (tauri.conf.json "index.html")
+                        // is the classic sidecar loading screen; the no-signal
+                        // launch must land on the splash connect form instead,
+                        // so navigate explicitly right after setup.
+                        log::info!(
+                            "[launch] no attach signal and no remembered server: \
+                             showing the splash connect form"
+                        );
+                        let splash_url = tauri::Url::parse("tauri://localhost/splash.html")
+                            .expect("splash page URL");
+                        if let Err(error) = window.navigate(splash_url) {
+                            log::error!("[launch] splash navigate failed: {error}");
+                        }
+                    }
+                },
             }
             Ok(())
         })
