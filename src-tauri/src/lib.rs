@@ -3,6 +3,7 @@
 //! readiness, and terminate the host when the app exits.
 
 mod host;
+mod launch;
 
 use tauri::Manager;
 
@@ -14,8 +15,25 @@ pub fn run() {
             let window = app
                 .get_webview_window("main")
                 .expect("main webview window from tauri.conf.json");
-            let manager = host::HostManager::spawn(app.handle().clone(), window);
-            app.manage(manager);
+            // Attach Mode (DSH_DESKTOP_ATTACH_URL / --attach-url): navigate
+            // straight to an already running server and skip the sidecar
+            // entirely — no HostManager is managed, and the exit hook's
+            // try_state() below simply finds nothing to stop.
+            match launch::resolve_launch_mode(
+                std::env::var(launch::ATTACH_URL_ENV).ok().as_deref(),
+                &std::env::args().collect::<Vec<_>>(),
+            ) {
+                launch::LaunchMode::Attach { url } => {
+                    log::info!("[launch] attach mode: navigating to {}", url.as_str());
+                    if let Err(error) = window.navigate(url) {
+                        log::error!("[launch] attach navigate failed: {error}");
+                    }
+                }
+                launch::LaunchMode::Sidecar => {
+                    let manager = host::HostManager::spawn(app.handle().clone(), window);
+                    app.manage(manager);
+                }
+            }
             Ok(())
         })
         .build(tauri::generate_context!())
