@@ -106,28 +106,57 @@ fn clear_remembered_at(path: &std::path::Path) -> Result<(), String> {
     }
 }
 
-/// Validate a user-typed attach URL. Mirrors dsh-tfd's resolver rule: http(s)
-/// only, non-empty host. Returns the normalized URL used for navigation.
+/// Validate a user-typed attach URL. Delegates to the shared launch validator
+/// (dsh-tfd rule: http(s) only) with a trim + non-empty pre-check, and adds
+/// a non-empty-host check: it rejects scheme-less input that `Url::parse`
+/// salvages as a path (e.g. "127.0.0.1:3080" parses as scheme "127.0.0.1").
+/// Returns the normalized URL used for navigation.
 fn validate_attach_url(input: &str) -> Result<Url, String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err("URL is empty".into());
     }
-    let url = Url::parse(trimmed).map_err(|error| format!("invalid URL: {error}"))?;
-    match url.scheme() {
-        "http" | "https" => {}
-        other => {
-            return Err(format!(
-                "unsupported scheme {other:?}: only http/https are allowed"
-            ))
-        }
-    }
-    // Reject scheme-less input that Url::parse salvages as a path
-    // (e.g. "127.0.0.1:3080" parses as scheme "127.0.0.1").
+    let url = crate::launch::parse_attach_url(trimmed)?;
     if url.host_str().is_none() {
         return Err("URL has no host".into());
     }
     Ok(url)
+}
+
+/// What the shell should do at startup when env/argv carry no attach signal
+/// (dsh-df4 priority: attach signal → attach; remembered server → attach;
+/// otherwise the splash connect form — the classic sidecar spawn no longer
+/// serves the no-signal case).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoSignalAction {
+    /// Attach to the remembered server (already re-validated).
+    Attach {
+        /// The validated remembered URL.
+        url: Url,
+    },
+    /// Show the splash connect form (`ui/splash.html`).
+    ShowForm,
+}
+
+/// Pure decision for the no-signal launch branch, extracted from the IO so it
+/// stays unit-testable. `remembered` is the raw store value (as returned by
+/// `read_remembered_url`); a value that somehow fails validation degrades to
+/// the form rather than navigating anywhere.
+pub fn decide_no_signal_launch(remembered: Option<&str>) -> NoSignalAction {
+    match remembered.map(validate_attach_url) {
+        Some(Ok(url)) => NoSignalAction::Attach { url },
+        Some(Err(error)) => {
+            log::warn!("[splash] remembered URL unusable at launch: {error}; showing the form");
+            NoSignalAction::ShowForm
+        }
+        None => NoSignalAction::ShowForm,
+    }
+}
+
+/// Read the remember store and decide the no-signal launch action (the IO
+/// half of `decide_no_signal_launch`; called from the lib.rs setup).
+pub fn resolve_no_signal_action() -> NoSignalAction {
+    decide_no_signal_launch(read_remembered_url().as_deref())
 }
 
 /// True when the URL points at loopback, where the server does not need
@@ -330,5 +359,33 @@ mod tests {
 
         std::env::remove_var("DSH_HOME");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn no_signal_decision_attaches_to_a_valid_remembered_url() {
+        use super::{decide_no_signal_launch, NoSignalAction};
+        assert_eq!(
+            decide_no_signal_launch(Some("http://127.0.0.1:3080")),
+            NoSignalAction::Attach {
+                url: "http://127.0.0.1:3080".parse().expect("test URL")
+            },
+            "a remembered server auto-connects with attach semantics"
+        );
+    }
+
+    #[test]
+    fn no_signal_decision_shows_the_form_without_or_with_a_bad_remembered_url() {
+        use super::{decide_no_signal_launch, NoSignalAction};
+        assert_eq!(decide_no_signal_launch(None), NoSignalAction::ShowForm);
+        assert_eq!(
+            decide_no_signal_launch(Some("ftp://x")),
+            NoSignalAction::ShowForm,
+            "an unusable remembered URL degrades to the form, never navigates"
+        );
+        assert_eq!(
+            decide_no_signal_launch(Some("127.0.0.1:3080")),
+            NoSignalAction::ShowForm,
+            "scheme-less salvage is rejected like in the connect form"
+        );
     }
 }

@@ -286,9 +286,15 @@ pub struct StubDiagnostics {
 
 /// Start (or retarget) attach-URL monitoring. Called on the attach launch
 /// path, on `--attach-url` forwarding, and after `splash_connect` — but only
-/// when no HostManager exists, so Sidecar mode is never probed.
+/// while a sidecar child is actually running, so Sidecar mode is never
+/// probed. (A state may linger after single-instance forwarding stopped the
+/// sidecar; `is_running` distinguishes that from live sidecar mode.)
 pub fn start_monitor(app: tauri::AppHandle, url: Url) {
-    if app.try_state::<crate::host::HostManager>().is_some() {
+    if app
+        .try_state::<crate::host::HostManager>()
+        .map(|manager| manager.is_running())
+        .unwrap_or(false)
+    {
         log::debug!("[probe] sidecar mode: probing not started");
         return;
     }

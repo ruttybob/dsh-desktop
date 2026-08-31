@@ -59,6 +59,15 @@
         font-size: 12px; color: #8ab4f0; text-align: center; min-height: 16px;
       }
       .connecting-note.error { color: #e8a87c; }
+      .forget-row { text-align: center; }
+      .forget-link {
+        font-size: 11px; color: #6b7078; background: none; border: none;
+        padding: 0; cursor: pointer; text-decoration: underline;
+        text-underline-offset: 3px; font: inherit; font-size: 11px;
+        display: none;
+      }
+      .forget-link.visible { display: inline; }
+      .forget-link:hover { color: #a9aeb8; }
     </style>
   </head>
   <body>
@@ -80,6 +89,11 @@
       </label>
       <button class="btn-connect" id="connectBtn">Connect</button>
       <div class="connecting-note" id="note"></div>
+      <div class="forget-row">
+        <button class="forget-link" id="forgetBtn" type="button">
+          Forget remembered server
+        </button>
+      </div>
     </div>
     <script>
       const urlInput = document.getElementById('urlInput');
@@ -133,18 +147,41 @@
       });
 
       // Prefill from the shell-owned remember store (last choice convenience;
-      // auto-connect for a remembered launch is the resolver's job).
+      // auto-connect for a remembered launch is the resolver's job). When a
+      // remembered server exists, offer a way to clear it (dsh-df4 AC:
+      // "remembered-выбор можно очистить и вернуться к форме").
+      const forgetBtn = document.getElementById('forgetBtn');
       invoke('splash_get_remembered')
         .then((remembered) => {
           if (remembered) {
             urlInput.value = remembered;
             refreshHint();
+            forgetBtn.classList.add('visible');
           }
         })
         .catch(() => {
           note.classList.add('error');
           note.textContent = 'Tauri IPC unavailable — connect form is inert.';
         });
+
+      forgetBtn.addEventListener('click', async () => {
+        forgetBtn.disabled = true;
+        try {
+          await invoke('splash_forget');
+          // Back to a pristine form state without a restart.
+          urlInput.value = '';
+          rememberChk.checked = false;
+          refreshHint();
+          forgetBtn.classList.remove('visible');
+          note.classList.remove('error');
+          note.textContent = 'Remembered server cleared.';
+        } catch (error) {
+          note.classList.add('error');
+          note.textContent = String(error);
+        } finally {
+          forgetBtn.disabled = false;
+        }
+      });
     </script>
   </body>
 </html>

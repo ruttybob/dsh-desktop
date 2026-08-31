@@ -113,7 +113,12 @@ pub fn resolve_relaunch_attach(args: &[String]) -> Option<Url> {
 }
 
 /// Validate a candidate attach URL: must parse and carry an http(s) scheme.
-fn parse_attach_url(raw: &str) -> Result<Url, String> {
+///
+/// The single shared attach-URL validator: the launch resolver (env + argv),
+/// the splash connect form (user-typed input, which trims and adds an extra
+/// non-empty-host check on top), and the remember store (re-validation at
+/// read time) all go through this one rule.
+pub(crate) fn parse_attach_url(raw: &str) -> Result<Url, String> {
     let url = Url::parse(raw).map_err(|error| format!("not a valid URL: {error}"))?;
     match url.scheme() {
         "http" | "https" => Ok(url),
@@ -311,6 +316,27 @@ mod tests {
     #[test]
     fn env_constant_matches_the_documented_name() {
         assert_eq!(ATTACH_URL_ENV, "DSH_DESKTOP_ATTACH_URL");
+    }
+
+    #[test]
+    fn shared_validator_accepts_http_and_https_only() {
+        use super::parse_attach_url;
+        assert_eq!(
+            parse_attach_url("http://127.0.0.1:3080")
+                .unwrap()
+                .to_string(),
+            "http://127.0.0.1:3080/"
+        );
+        assert!(parse_attach_url("https://dsh.example.com").is_ok());
+        for bad in [
+            "ftp://127.0.0.1:3080",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "not a url",
+            "http://",
+        ] {
+            assert!(parse_attach_url(bad).is_err(), "expected reject: {bad:?}");
+        }
     }
 
     #[test]

@@ -23,6 +23,12 @@ pub struct HostManager {
 impl HostManager {
     /// Locate the bundled host and spawn it. Returns a manager even when the
     /// spawn failed (the window stays on the splash; logs explain why).
+    ///
+    /// Currently unreachable from launch resolution: splash replaced the
+    /// sidecar in the no-signal case (dsh-df4 AC1). Retained intact as the
+    /// classic sidecar launch path (behind `allow(dead_code)`, which also
+    /// keeps its private helper chain lint-clean).
+    #[allow(dead_code)]
     pub fn spawn(app: AppHandle, window: WebviewWindow) -> Self {
         let host_dirs = resolve_host_dirs(&app);
         let Some(host_dir) = host_dirs.iter().find(|dir| dir.join("main.mjs").exists()) else {
@@ -124,6 +130,14 @@ impl HostManager {
         });
 
         manager
+    }
+
+    /// True while a sidecar child is running. `stop()` only takes the child
+    /// out of the manager — the managed state itself stays registered — so
+    /// callers that must distinguish "sidecar alive" from "stopped, now
+    /// attaching" use this instead of mere state existence.
+    pub fn is_running(&self) -> bool {
+        self.child.lock().expect("host child lock").is_some()
     }
 
     /// Terminate the host process (hard kill; the harness persists its own
@@ -348,7 +362,9 @@ fn parse_url_line(line: &str) -> Option<String> {
     let trimmed = line.trim();
     let start = trimmed.find(PREFIX)?;
     let rest = &trimmed[start + PREFIX.len()..];
-    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let end = rest
+        .find(char::is_whitespace)
+        .unwrap_or(rest.len());
     let token = &rest[..end];
     let port: String = token.chars().take_while(|c| c.is_ascii_digit()).collect();
     if port.is_empty() {
@@ -495,9 +511,7 @@ mod tests {
         );
         // A trailing LAN suffix (whitespace delimiter) is left untouched.
         assert_eq!(
-            redact_token(
-                "dsh web: http://127.0.0.1:3080?token=abc123 (LAN: http://192.168.1.2:3080)"
-            ),
+            redact_token("dsh web: http://127.0.0.1:3080?token=abc123 (LAN: http://192.168.1.2:3080)"),
             "dsh web: http://127.0.0.1:3080?token=[redacted] (LAN: http://192.168.1.2:3080)"
         );
     }
@@ -563,17 +577,8 @@ mod tests {
         assert_eq!(parse_url_line("dsh web: http://127.0.0.1:"), None);
         // Non-loopback authorities are rejected, tokenized or not.
         assert_eq!(parse_url_line("dsh web: http://0.0.0.0:3080"), None);
-        assert_eq!(
-            parse_url_line("dsh web: http://0.0.0.0:3080?token=abc"),
-            None
-        );
-        assert_eq!(
-            parse_url_line("dsh web: http://192.168.1.2:3080?token=abc"),
-            None
-        );
-        assert_eq!(
-            parse_url_line("dsh web: http://localhost:3080?token=abc"),
-            None
-        );
+        assert_eq!(parse_url_line("dsh web: http://0.0.0.0:3080?token=abc"), None);
+        assert_eq!(parse_url_line("dsh web: http://192.168.1.2:3080?token=abc"), None);
+        assert_eq!(parse_url_line("dsh web: http://localhost:3080?token=abc"), None);
     }
 }
