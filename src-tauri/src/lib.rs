@@ -3,6 +3,7 @@
 //! readiness, and terminate the host when the app exits.
 
 mod host;
+mod splash;
 
 use tauri::Manager;
 
@@ -10,6 +11,13 @@ use tauri::Manager;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_log::Builder::new().build())
+        // Splash connect-form commands (dsh-df4): the page decides nothing
+        // itself — validation, remember store, and navigation are host-side.
+        .invoke_handler(tauri::generate_handler![
+            splash::splash_connect,
+            splash::splash_get_remembered,
+            splash::splash_forget
+        ])
         .setup(|app| {
             let window = app
                 .get_webview_window("main")
