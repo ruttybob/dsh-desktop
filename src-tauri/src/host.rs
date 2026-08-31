@@ -336,17 +336,25 @@ fn ensure_workspace_dir() -> PathBuf {
     workspace
 }
 
-/// Extract `http://127.0.0.1:<port>` from the host's `dsh web: <url>` line.
+/// Extract the full loopback URL (including any query string) from the host's
+/// `dsh web: <url>` line. Only the first whitespace token after the marker is
+/// taken, so a trailing LAN suffix is dropped; only `http://127.0.0.1:` with at
+/// least one port digit is accepted, so non-loopback authorities (0.0.0.0 and
+/// any other host) resolve to `None`.
 fn parse_url_line(line: &str) -> Option<String> {
     const PREFIX: &str = "dsh web: http://127.0.0.1:";
     let trimmed = line.trim();
     let start = trimmed.find(PREFIX)?;
     let rest = &trimmed[start + PREFIX.len()..];
-    let port: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let end = rest
+        .find(char::is_whitespace)
+        .unwrap_or(rest.len());
+    let token = &rest[..end];
+    let port: String = token.chars().take_while(|c| c.is_ascii_digit()).collect();
     if port.is_empty() {
         return None;
     }
-    Some(format!("http://127.0.0.1:{port}"))
+    Some(format!("http://127.0.0.1:{token}"))
 }
 
 #[cfg(test)]
@@ -470,12 +478,39 @@ mod tests {
             parse_url_line("dsh web: http://127.0.0.1:41237 (LAN: http://192.168.1.2:41237)"),
             Some("http://127.0.0.1:41237".to_string())
         );
+        // Legacy no-query strings parse exactly as before.
+        assert_eq!(
+            parse_url_line("dsh web: http://127.0.0.1:2060"),
+            Some("http://127.0.0.1:2060".to_string())
+        );
+    }
+
+    #[test]
+    fn keeps_the_whole_tokenized_url_and_drops_the_lan_suffix() {
+        // The full URL, query (launch token) included, is preserved verbatim.
+        assert_eq!(
+            parse_url_line("dsh web: http://127.0.0.1:3080?token=abc123"),
+            Some("http://127.0.0.1:3080?token=abc123".to_string())
+        );
+        // A trailing LAN suffix is whitespace-separated and dropped.
+        assert_eq!(
+            parse_url_line(
+                "dsh web: http://127.0.0.1:41237?token=xyz (LAN: http://192.168.1.2:41237)"
+            ),
+            Some("http://127.0.0.1:41237?token=xyz".to_string())
+        );
     }
 
     #[test]
     fn ignores_other_lines() {
         assert_eq!(parse_url_line("some other log line"), None);
-        assert_eq!(parse_url_line("dsh web: http://0.0.0.0:3080"), None);
         assert_eq!(parse_url_line(""), None);
+        // Missing port digit.
+        assert_eq!(parse_url_line("dsh web: http://127.0.0.1:"), None);
+        // Non-loopback authorities are rejected, tokenized or not.
+        assert_eq!(parse_url_line("dsh web: http://0.0.0.0:3080"), None);
+        assert_eq!(parse_url_line("dsh web: http://0.0.0.0:3080?token=abc"), None);
+        assert_eq!(parse_url_line("dsh web: http://192.168.1.2:3080?token=abc"), None);
+        assert_eq!(parse_url_line("dsh web: http://localhost:3080?token=abc"), None);
     }
 }
