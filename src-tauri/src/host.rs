@@ -104,13 +104,15 @@ impl HostManager {
         });
 
         // stdout reader: forward, and navigate the WebView on the URL line.
+        // Forwarded lines are token-redacted; only the in-memory navigation
+        // URL keeps the launch token.
         thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                log::info!("[host] {line}");
+                log::info!("[host] {}", redact_token(&line));
                 if let Some(url) = parse_url_line(&line) {
                     match Url::parse(&url) {
                         Ok(url) => {
-                            log::info!("[host] navigating to {url}");
+                            log::info!("[host] navigating to {}", redact_token(url.as_str()));
                             if let Err(error) = window.navigate(url) {
                                 log::error!("[host] navigate failed: {error}");
                             }
@@ -357,9 +359,28 @@ fn parse_url_line(line: &str) -> Option<String> {
     Some(format!("http://127.0.0.1:{token}"))
 }
 
+/// Replace every `token=<value>` occurrence (value runs to the next `&`,
+/// whitespace, or end of string) with `token=[redacted]`. Applied to host
+/// stdout before it reaches the log: the launch token is a bearer secret and
+/// the unredacted URL must live only in memory, used solely for navigation.
+fn redact_token(line: &str) -> String {
+    const MARKER: &str = "token=";
+    let mut result = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(at) = rest.find(MARKER) {
+        result.push_str(&rest[..at + MARKER.len()]);
+        rest = &rest[at + MARKER.len()..];
+        let end = rest.find(['&', ' ']).unwrap_or(rest.len());
+        rest = &rest[end..];
+        result.push_str("[redacted]");
+    }
+    result.push_str(rest);
+    result
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_url_line;
+    use super::{parse_url_line, redact_token};
 
     #[cfg(unix)]
     mod shell_path {
@@ -466,6 +487,39 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn redacts_the_token_value() {
+        assert_eq!(
+            redact_token("dsh web: http://127.0.0.1:3080?token=abc123"),
+            "dsh web: http://127.0.0.1:3080?token=[redacted]"
+        );
+        // A trailing LAN suffix (whitespace delimiter) is left untouched.
+        assert_eq!(
+            redact_token("dsh web: http://127.0.0.1:3080?token=abc123 (LAN: http://192.168.1.2:3080)"),
+            "dsh web: http://127.0.0.1:3080?token=[redacted] (LAN: http://192.168.1.2:3080)"
+        );
+    }
+
+    #[test]
+    fn leaves_lines_without_a_query_untouched() {
+        assert_eq!(
+            redact_token("dsh web: http://127.0.0.1:3080"),
+            "dsh web: http://127.0.0.1:3080"
+        );
+        assert_eq!(redact_token("some other log line"), "some other log line");
+        assert_eq!(redact_token(""), "");
+    }
+
+    #[test]
+    fn redacts_every_token_and_honors_the_query_delimiter() {
+        // Multiple occurrences, and `&` ends the value so remaining query
+        // parameters survive.
+        assert_eq!(
+            redact_token("GET /?token=abc&next=1 x token=def"),
+            "GET /?token=[redacted]&next=1 x token=[redacted]"
+        );
     }
 
     #[test]
