@@ -30,6 +30,8 @@ const hostEntry = useBundled ? join(bundled, 'main.mjs') : join(root, 'host', 'm
 
 // Capture the whole first whitespace token after the `dsh web:` marker, so a
 // query string (`?token=...`) is preserved rather than truncated at the port.
+// Keep in sync with `parse_url_line` in src-tauri/src/host.rs — the two define
+// the same ready-line grammar in different languages.
 const URL_LINE = /dsh web: (https?:\/\/127\.0\.0\.1:\d+\S*)/
 
 // Hermetic boot: an isolated DSH_HOME keeps user-installed plugins (built
@@ -125,6 +127,9 @@ process.exit(1)
 // if the host answers with a 303 auth redirect, replay the Set-Cookie onto the
 // origin root. Returns the index body if the shell marker is served, else null.
 async function fetchIndex(tokenizedUrl) {
+  // The caller only checks whether the shell index was served, so any
+  // non-null value means success.
+  const looksLikeShell = (ok, body) => (ok && body.includes('<div id="root">') ? body : null)
   const res = await fetch(tokenizedUrl, { redirect: 'manual' })
   if (res.status === 303) {
     const cookie = getFirstCookie(res)
@@ -134,11 +139,9 @@ async function fetchIndex(tokenizedUrl) {
       headers: { Cookie: cookie },
       redirect: 'manual',
     })
-    const body = await index.text()
-    return index.ok && body.includes('<div id="root">') ? body : null
+    return looksLikeShell(index.ok, await index.text())
   }
-  const body = await res.text()
-  return res.ok && body.includes('<div id="root">') ? body : null
+  return looksLikeShell(res.ok, await res.text())
 }
 
 // Mask a launch token in a URL for console output; the unredacted value is
