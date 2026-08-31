@@ -104,13 +104,15 @@ impl HostManager {
         });
 
         // stdout reader: forward, and navigate the WebView on the URL line.
+        // Forwarded lines are token-redacted; only the in-memory navigation
+        // URL keeps the launch token.
         thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                log::info!("[host] {line}");
+                log::info!("[host] {}", redact_token(&line));
                 if let Some(url) = parse_url_line(&line) {
                     match Url::parse(&url) {
                         Ok(url) => {
-                            log::info!("[host] navigating to {url}");
+                            log::info!("[host] navigating to {}", redact_token(url.as_str()));
                             if let Err(error) = window.navigate(url) {
                                 log::error!("[host] navigate failed: {error}");
                             }
@@ -336,22 +338,49 @@ fn ensure_workspace_dir() -> PathBuf {
     workspace
 }
 
-/// Extract `http://127.0.0.1:<port>` from the host's `dsh web: <url>` line.
+/// Extract the full loopback URL (including any query string) from the host's
+/// `dsh web: <url>` line. Only the first whitespace token after the marker is
+/// taken, so a trailing LAN suffix is dropped; only `http://127.0.0.1:` with at
+/// least one port digit is accepted, so non-loopback authorities (0.0.0.0 and
+/// any other host) resolve to `None`.
 fn parse_url_line(line: &str) -> Option<String> {
     const PREFIX: &str = "dsh web: http://127.0.0.1:";
     let trimmed = line.trim();
     let start = trimmed.find(PREFIX)?;
     let rest = &trimmed[start + PREFIX.len()..];
-    let port: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let end = rest
+        .find(char::is_whitespace)
+        .unwrap_or(rest.len());
+    let token = &rest[..end];
+    let port: String = token.chars().take_while(|c| c.is_ascii_digit()).collect();
     if port.is_empty() {
         return None;
     }
-    Some(format!("http://127.0.0.1:{port}"))
+    Some(format!("http://127.0.0.1:{token}"))
+}
+
+/// Replace every `token=<value>` occurrence (value runs to the next `&`,
+/// whitespace, or end of string) with `token=[redacted]`. Applied to host
+/// stdout before it reaches the log: the launch token is a bearer secret and
+/// the unredacted URL must live only in memory, used solely for navigation.
+fn redact_token(line: &str) -> String {
+    const MARKER: &str = "token=";
+    let mut result = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(at) = rest.find(MARKER) {
+        result.push_str(&rest[..at + MARKER.len()]);
+        rest = &rest[at + MARKER.len()..];
+        let end = rest.find(['&', ' ']).unwrap_or(rest.len());
+        rest = &rest[end..];
+        result.push_str("[redacted]");
+    }
+    result.push_str(rest);
+    result
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_url_line;
+    use super::{parse_url_line, redact_token};
 
     #[cfg(unix)]
     mod shell_path {
@@ -461,6 +490,39 @@ mod tests {
     }
 
     #[test]
+    fn redacts_the_token_value() {
+        assert_eq!(
+            redact_token("dsh web: http://127.0.0.1:3080?token=abc123"),
+            "dsh web: http://127.0.0.1:3080?token=[redacted]"
+        );
+        // A trailing LAN suffix (whitespace delimiter) is left untouched.
+        assert_eq!(
+            redact_token("dsh web: http://127.0.0.1:3080?token=abc123 (LAN: http://192.168.1.2:3080)"),
+            "dsh web: http://127.0.0.1:3080?token=[redacted] (LAN: http://192.168.1.2:3080)"
+        );
+    }
+
+    #[test]
+    fn leaves_lines_without_a_query_untouched() {
+        assert_eq!(
+            redact_token("dsh web: http://127.0.0.1:3080"),
+            "dsh web: http://127.0.0.1:3080"
+        );
+        assert_eq!(redact_token("some other log line"), "some other log line");
+        assert_eq!(redact_token(""), "");
+    }
+
+    #[test]
+    fn redacts_every_token_and_honors_the_query_delimiter() {
+        // Multiple occurrences, and `&` ends the value so remaining query
+        // parameters survive.
+        assert_eq!(
+            redact_token("GET /?token=abc&next=1 x token=def"),
+            "GET /?token=[redacted]&next=1 x token=[redacted]"
+        );
+    }
+
+    #[test]
     fn parses_the_url_line() {
         assert_eq!(
             parse_url_line("dsh web: http://127.0.0.1:3080"),
@@ -470,12 +532,39 @@ mod tests {
             parse_url_line("dsh web: http://127.0.0.1:41237 (LAN: http://192.168.1.2:41237)"),
             Some("http://127.0.0.1:41237".to_string())
         );
+        // Legacy no-query strings parse exactly as before.
+        assert_eq!(
+            parse_url_line("dsh web: http://127.0.0.1:2060"),
+            Some("http://127.0.0.1:2060".to_string())
+        );
+    }
+
+    #[test]
+    fn keeps_the_whole_tokenized_url_and_drops_the_lan_suffix() {
+        // The full URL, query (launch token) included, is preserved verbatim.
+        assert_eq!(
+            parse_url_line("dsh web: http://127.0.0.1:3080?token=abc123"),
+            Some("http://127.0.0.1:3080?token=abc123".to_string())
+        );
+        // A trailing LAN suffix is whitespace-separated and dropped.
+        assert_eq!(
+            parse_url_line(
+                "dsh web: http://127.0.0.1:41237?token=xyz (LAN: http://192.168.1.2:41237)"
+            ),
+            Some("http://127.0.0.1:41237?token=xyz".to_string())
+        );
     }
 
     #[test]
     fn ignores_other_lines() {
         assert_eq!(parse_url_line("some other log line"), None);
-        assert_eq!(parse_url_line("dsh web: http://0.0.0.0:3080"), None);
         assert_eq!(parse_url_line(""), None);
+        // Missing port digit.
+        assert_eq!(parse_url_line("dsh web: http://127.0.0.1:"), None);
+        // Non-loopback authorities are rejected, tokenized or not.
+        assert_eq!(parse_url_line("dsh web: http://0.0.0.0:3080"), None);
+        assert_eq!(parse_url_line("dsh web: http://0.0.0.0:3080?token=abc"), None);
+        assert_eq!(parse_url_line("dsh web: http://192.168.1.2:3080?token=abc"), None);
+        assert_eq!(parse_url_line("dsh web: http://localhost:3080?token=abc"), None);
     }
 }
