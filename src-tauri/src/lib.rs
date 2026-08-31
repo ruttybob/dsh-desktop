@@ -10,6 +10,33 @@ use tauri::Manager;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Single-instance guard MUST be the first plugin registered (per the
+        // plugin docs): it claims the identity socket early so a second launch
+        // is refused before any other plugin/setup can spawn the sidecar. The
+        // guard is also the only protection against two sidecars racing
+        // ~/.dsh/storages with last-write-wins. On relaunch the second
+        // instance's argv (not env — LaunchServices drops it) arrives here; an
+        // --attach-url in it re-targets the running window.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            log::info!("[single-instance] second instance argv: {argv:?}");
+            let args: Vec<String> = argv.to_vec();
+            if let Some(url) = launch::resolve_relaunch_attach(&args) {
+                log::info!("[single-instance] forwarding attach to {url}",);
+                // The main window may not exist yet when the callback fires
+                // during first-instance startup, so resolve it here rather
+                // than capturing it from setup.
+                match app.get_webview_window("main") {
+                    Some(window) => {
+                        if let Err(error) = window.navigate(url) {
+                            log::error!("[single-instance] attach navigate failed: {error}");
+                        }
+                    }
+                    None => log::error!(
+                        "[single-instance] no main window yet; attach request dropped"
+                    ),
+                }
+            }
+        }))
         .plugin(tauri_plugin_log::Builder::new().build())
         .setup(|app| {
             let window = app

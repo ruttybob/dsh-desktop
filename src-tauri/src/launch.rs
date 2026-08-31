@@ -86,6 +86,30 @@ pub fn resolve_launch_mode(env_value: Option<&str>, args: &[String]) -> LaunchMo
     }
 }
 
+/// Resolve a *relaunch* attach request from the second instance's argv.
+///
+/// This is the single-instance forwarding seam: when a second app instance is
+/// launched with `--attach-url`, its argv is delivered to the first instance's
+/// single-instance callback, which navigates the existing window to the URL.
+/// The env variable is deliberately NOT consulted here — on macOS relaunches
+/// via LaunchServices the environment of the second process is not forwarded
+/// anyway, so honoring it would only create a platform-dependent behavior
+/// difference.
+///
+/// `Some(url)` — a well-formed attach request to apply; `None` — no attach
+/// flag in argv, or one that failed validation (already logged), in which
+/// case the running instance simply keeps its current target.
+pub fn resolve_relaunch_attach(args: &[String]) -> Option<Url> {
+    match parse_attach_arg(args) {
+        Some(Ok(url)) => Some(url),
+        Some(Err(error)) => {
+            log::error!("[launch] ignoring invalid relaunch {ATTACH_URL_FLAG} argument: {error}");
+            None
+        }
+        None => None,
+    }
+}
+
 /// Validate a candidate attach URL: must parse and carry an http(s) scheme.
 fn parse_attach_url(raw: &str) -> Result<Url, String> {
     let url = Url::parse(raw).map_err(|error| format!("not a valid URL: {error}"))?;
@@ -269,5 +293,34 @@ mod tests {
     #[test]
     fn env_constant_matches_the_documented_name() {
         assert_eq!(ATTACH_URL_ENV, "DSH_DESKTOP_ATTACH_URL");
+    }
+
+    #[test]
+    fn relaunch_forwarding_extracts_a_valid_attach_url() {
+        assert_eq!(
+            super::resolve_relaunch_attach(&args(&["--attach-url", "http://127.0.0.1:41237"])),
+            Some(tauri::Url::parse("http://127.0.0.1:41237").expect("test URL")),
+        );
+        assert_eq!(
+            super::resolve_relaunch_attach(&args(&["--attach-url=https://h:9"])),
+            Some(tauri::Url::parse("https://h:9").expect("test URL")),
+        );
+    }
+
+    #[test]
+    fn relaunch_forwarding_ignores_unrelated_or_invalid_argv() {
+        // No attach flag at all: plain relaunch keeps the current target.
+        assert_eq!(super::resolve_relaunch_attach(&args(&[])), None);
+        assert_eq!(
+            super::resolve_relaunch_attach(&args(&["--verbose"])),
+            None,
+            "unrelated arguments are not a forward request"
+        );
+        // An invalid URL must never navigate the running instance anywhere.
+        assert_eq!(
+            super::resolve_relaunch_attach(&args(&["--attach-url=javascript:alert(1)"])),
+            None,
+        );
+        assert_eq!(super::resolve_relaunch_attach(&args(&["--attach-url"])), None);
     }
 }
