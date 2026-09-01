@@ -163,6 +163,11 @@ fn probe_connect(url: &Url) -> ConnectOutcome {
         return ConnectOutcome::Unresolved;
     };
     let port = url.port_or_known_default().unwrap_or(80);
+    // Accepted degradation (dsh-cxq review): to_socket_addrs is blocking DNS
+    // with no timeout. It runs on the daemon probe thread (or a manual Retry
+    // command), so worst case one probe overruns PROBE_TIMEOUT by the
+    // resolver's own timeout; bounded neither for simplicity nor with extra
+    // dependencies.
     let Ok(mut addresses) = (host, port).to_socket_addrs() else {
         return ConnectOutcome::Unresolved;
     };
@@ -319,7 +324,12 @@ pub fn start_monitor(app: tauri::AppHandle, url: Url) {
         // module docs for why nothing here outlives the app).
         std::thread::spawn(move || probe_loop(app));
     }
-    log::info!("[probe] monitoring {}", url.as_str());
+    // Attach URLs may carry ?token=<bearer-secret>; only logs are redacted
+    // (the in-memory monitored URL keeps the token, matching host.rs).
+    log::info!(
+        "[probe] monitoring {}",
+        crate::host::redact_token(url.as_str())
+    );
 }
 
 /// Stop monitoring (target cleared). Nothing currently calls this on the
@@ -358,6 +368,12 @@ fn probe_loop(app: tauri::AppHandle) {
                     None
                 }
             } else {
+                // Count this failure before sleeping: the backoff schedule
+                // (1/2/4/8/15s) is keyed on the incremented attempt, so the
+                // sleep below and stub_diagnostics agree on honest timing.
+                // (Manual stub_retry shares this counter and does its own
+                // single increment per retry — no double counting.)
+                target.attempt = target.attempt.saturating_add(1);
                 if !target.on_stub {
                     target.on_stub = true;
                     Some(
@@ -373,7 +389,7 @@ fn probe_loop(app: tauri::AppHandle) {
             if let Some(window) = app.get_webview_window("main") {
                 log::info!(
                     "[probe] navigating main window to {} (verdict: {})",
-                    target.as_str(),
+                    crate::host::redact_token(target.as_str()),
                     if target.as_str().ends_with(STUB_PAGE) {
                         "dead"
                     } else {
@@ -391,7 +407,7 @@ fn probe_loop(app: tauri::AppHandle) {
             match inner.target.as_ref() {
                 None => return,
                 Some(target) if !verdict.alive => {
-                    Duration::from_millis(backoff_delay_ms(target.attempt + 1))
+                    Duration::from_millis(backoff_delay_ms(target.attempt))
                 }
                 Some(_) => ALIVE_POLL_INTERVAL,
             }
@@ -402,9 +418,10 @@ fn probe_loop(app: tauri::AppHandle) {
 
 /// IPC: probe again right now. On success the window is navigated back to the
 /// server; on failure the stub stays and the attempt counter / backoff step
-/// shown in diagnostics keep growing.
+/// shown in diagnostics keep growing. `async` so the blocking probe (up to
+/// ~3s connect + ~3s read) runs off the main thread and the UI never hangs.
 #[tauri::command]
-pub fn stub_retry(app: tauri::AppHandle, window: WebviewWindow) -> Result<bool, String> {
+pub async fn stub_retry(app: tauri::AppHandle, window: WebviewWindow) -> Result<bool, String> {
     let (url, attempt) = {
         let managed = app.state::<ProbeMonitor>();
         let inner = managed.inner.lock().expect("probe monitor lock");
@@ -426,7 +443,7 @@ pub fn stub_retry(app: tauri::AppHandle, window: WebviewWindow) -> Result<bool, 
             target.attempt = 0;
             target.on_stub = false;
         } else {
-            target.attempt = attempt + 1;
+            target.attempt = attempt.saturating_add(1);
         }
     }
     if verdict.alive {
@@ -461,7 +478,7 @@ pub fn stub_diagnostics(app: tauri::AppHandle) -> Option<StubDiagnostics> {
         next_retry_ms: if target.attempt == 0 {
             0
         } else {
-            backoff_delay_ms(target.attempt + 1)
+            backoff_delay_ms(target.attempt)
         },
         on_stub: target.on_stub,
         non_loopback: target.non_loopback,
