@@ -25,10 +25,16 @@ jobs:
       - name: Install host dependencies (@deepseek-ai/dsh)
         run: pnpm -C host install --prod
 
-      - name: Boot the web profile and probe the served shell HTML
+      - name: Assemble the bundled host (the exact shipped artifact)
+        run: npm run host:bundle
+
+      - name: Boot the exact shipped bundle and probe the served shell HTML
         run: node scripts/smoke-host.mjs
         env:
           DSH_DESKTOP_SMOKE_TIMEOUT_MS: "180000"
+          # The bundle was just assembled above; a silent fallback to the
+          # checkout host/ directory would defeat the point of this job.
+          DSH_DESKTOP_REQUIRE_BUNDLE: "1"
 
   cargo-check:
     name: cargo check

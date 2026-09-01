@@ -22,13 +22,7 @@ pub struct HostManager {
 
 impl HostManager {
     /// Locate the bundled host and spawn it. Returns a manager even when the
-    /// spawn failed (the window stays on the splash; logs explain why).
-    ///
-    /// Currently unreachable from launch resolution: splash replaced the
-    /// sidecar in the no-signal case (dsh-df4 AC1). Retained intact as the
-    /// classic sidecar launch path (behind `allow(dead_code)`, which also
-    /// keeps its private helper chain lint-clean).
-    #[allow(dead_code)]
+    /// spawn failed (the window stays on the loading screen; logs explain why).
     pub fn spawn(app: AppHandle, window: WebviewWindow) -> Self {
         let host_dirs = resolve_host_dirs(&app);
         let Some(host_dir) = host_dirs.iter().find(|dir| dir.join("main.mjs").exists()) else {
@@ -102,10 +96,21 @@ impl HostManager {
             child: Mutex::new(Some(child)),
         };
 
-        // stderr reader: forward everything (harness logs, boot errors).
+        // Surface the bundled harness release in the log at boot so the user
+        // always knows which build is booting; the loading-screen line is
+        // patched by the page-load hook (lib.rs) once the page's DOM is
+        // deterministically ready.
+        let version = bundled_host_version(host_dir);
+        log::info!(
+            "[host] bundled harness version: {}",
+            version.as_deref().unwrap_or("unknown")
+        );
+
+        // stderr reader: forward everything (harness logs, boot errors),
+        // redacted like stdout (see `log_redacted`).
         thread::spawn(move || {
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                log::info!("[host] {line}");
+                log_redacted(&line);
             }
         });
 
@@ -114,7 +119,7 @@ impl HostManager {
         // URL keeps the launch token.
         thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                log::info!("[host] {}", redact_token(&line));
+                log_redacted(&line);
                 if let Some(url) = parse_url_line(&line) {
                     match Url::parse(&url) {
                         Ok(url) => {
@@ -132,14 +137,6 @@ impl HostManager {
         manager
     }
 
-    /// True while a sidecar child is running. `stop()` only takes the child
-    /// out of the manager — the managed state itself stays registered — so
-    /// callers that must distinguish "sidecar alive" from "stopped, now
-    /// attaching" use this instead of mere state existence.
-    pub fn is_running(&self) -> bool {
-        self.child.lock().expect("host child lock").is_some()
-    }
-
     /// Terminate the host process (hard kill; the harness persists its own
     /// state on disk, so no graceful shutdown is required).
     pub fn stop(&self) {
@@ -153,6 +150,51 @@ impl HostManager {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+}
+
+/// The bundled harness release version: the top-level `version` field of
+/// `@deepseek-ai/dsh/package.json` inside the bundle. A missing, unreadable,
+/// or non-JSON manifest yields `None` (the version line is then "unknown").
+/// The manifest is parsed as JSON, so nested `version` keys are ignored and
+/// field spacing is irrelevant — only the manifest's own field counts.
+fn bundled_host_version(host_dir: &Path) -> Option<String> {
+    let manifest = host_dir
+        .join("node_modules")
+        .join("@deepseek-ai/dsh")
+        .join("package.json");
+    let raw = std::fs::read_to_string(manifest).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let version = value.get("version")?.as_str()?;
+    (!version.is_empty()).then(|| version.to_string())
+}
+
+/// Patch the bundled harness version into the loading screen's `#status`
+/// line ("loading-screen line or log" — the log always gets it in `spawn`).
+/// Called from the page-load hook in lib.rs when the loading page has
+/// finished loading its DOM — deterministic, no delay to guess. The URL
+/// guard there keeps this off the harness page the ready line navigates to.
+/// A character whitelist on the version keeps the injected JS literal inert.
+pub(crate) fn surface_version(webview: &tauri::Webview<tauri::Wry>) {
+    let Some(host_dir) = resolve_host_dirs(webview.app_handle())
+        .into_iter()
+        .find(|dir| dir.join("main.mjs").exists())
+    else {
+        return;
+    };
+    let Some(version) = bundled_host_version(&host_dir) else {
+        return;
+    };
+    let safe: String = version
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+' | '_'))
+        .collect();
+    let script = format!(
+        "const s = document.getElementById('status'); \
+         if (s) {{ s.textContent = 'Starting the sidecar host v{safe}…'; }}"
+    );
+    if let Err(error) = webview.eval(&script) {
+        log::warn!("[host] version line on the loading screen failed: {error}");
     }
 }
 
@@ -373,13 +415,13 @@ fn parse_url_line(line: &str) -> Option<String> {
     Some(format!("http://127.0.0.1:{token}"))
 }
 
-/// Replace every `token=<value>` occurrence (value runs to the next `&`,
-/// whitespace, or end of string) with `token=[redacted]`. Applied to host
-/// stdout before it reaches the log: the launch token is a bearer secret and
-/// the unredacted URL must live only in memory, used solely for navigation.
-/// `pub(crate)`: every module that logs an attach-related URL or argv
-/// (splash, stub, lib single-instance forwarding) applies the same redaction.
-pub(crate) fn redact_token(line: &str) -> String {
+/// Internal helper: replace every `token=<value>` occurrence (value runs to
+/// the next `&`, whitespace, or end of string) with `token=[redacted]`. Every
+/// host-output line that reaches the log passes through it — the stdout
+/// ready-line/URL lines and the stderr forward alike — because the launch
+/// token is a bearer secret: the unredacted URL lives only in memory, used
+/// solely for navigation.
+fn redact_token(line: &str) -> String {
     const MARKER: &str = "token=";
     let mut result = String::with_capacity(line.len());
     let mut rest = line;
@@ -392,6 +434,12 @@ pub(crate) fn redact_token(line: &str) -> String {
     }
     result.push_str(rest);
     result
+}
+
+/// Every host-output line that reaches the log passes through here: the
+/// launch token is a bearer secret, so redaction happens before logging.
+fn log_redacted(line: &str) {
+    log::info!("[host] {}", redact_token(line));
 }
 
 #[cfg(test)]
@@ -502,6 +550,104 @@ mod tests {
                 resolve_in_path(&plain_only.display().to_string(), "absent"),
                 None
             );
+        }
+    }
+
+    mod bundled_host_version {
+        use super::super::bundled_host_version;
+        use std::path::{Path, PathBuf};
+
+        /// A unique scratch host root that cleans itself up, safe under
+        /// parallel runs.
+        struct Scratch(PathBuf);
+
+        impl Scratch {
+            fn new(tag: &str) -> Self {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_nanos())
+                    .unwrap_or_default();
+                let dir = std::env::temp_dir().join(format!(
+                    "dsh-desktop-host-version-{tag}-{}-{nanos}",
+                    std::process::id(),
+                ));
+                std::fs::create_dir_all(&dir).expect("create scratch root");
+                Self(dir)
+            }
+        }
+
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        /// Lay down the bundled-host manifest the extraction scans.
+        fn write_manifest(host_dir: &Path, body: &str) {
+            let package_dir = host_dir
+                .join("node_modules")
+                .join("@deepseek-ai")
+                .join("dsh");
+            std::fs::create_dir_all(&package_dir).expect("mkdir package dir");
+            std::fs::write(package_dir.join("package.json"), body).expect("write manifest");
+        }
+
+        #[test]
+        fn extracts_the_bundled_manifest_version() {
+            let scratch = Scratch::new("basic");
+            write_manifest(
+                &scratch.0,
+                r#"{"name":"@deepseek-ai/dsh","version":"1.2.3-beta.4"}"#,
+            );
+            assert_eq!(
+                bundled_host_version(&scratch.0),
+                Some("1.2.3-beta.4".to_string())
+            );
+        }
+
+        #[test]
+        fn ignores_nested_version_fields() {
+            // Only the manifest's top-level `version` field counts: a nested
+            // key (here a devDependencies-style object) must not be picked up
+            // no matter where it sits in the document.
+            let scratch = Scratch::new("nested");
+            write_manifest(
+                &scratch.0,
+                r#"{"devDependencies":{"version":"2.0.0-rc.1"},"version":"1.2.3"}"#,
+            );
+            assert_eq!(
+                bundled_host_version(&scratch.0),
+                Some("1.2.3".to_string())
+            );
+        }
+
+        #[test]
+        fn parses_the_manifest_regardless_of_field_spacing() {
+            // The manifest is parsed as JSON, not scanned for a marker, so
+            // spacing around the colon cannot hide the field.
+            let scratch = Scratch::new("spacing");
+            write_manifest(&scratch.0, r#"{ "name" : "@deepseek-ai/dsh" , "version" : "1.2.3" }"#);
+            assert_eq!(bundled_host_version(&scratch.0), Some("1.2.3".to_string()));
+        }
+
+        #[test]
+        fn returns_none_for_a_non_json_manifest() {
+            let scratch = Scratch::new("non-json");
+            write_manifest(&scratch.0, "not json at all");
+            assert_eq!(bundled_host_version(&scratch.0), None);
+        }
+
+        #[test]
+        fn returns_none_when_the_manifest_is_missing() {
+            let scratch = Scratch::new("missing");
+            assert_eq!(bundled_host_version(&scratch.0), None);
+        }
+
+        #[test]
+        fn returns_none_for_an_empty_version_value() {
+            let scratch = Scratch::new("empty");
+            write_manifest(&scratch.0, r#"{"name":"@deepseek-ai/dsh","version":""}"#);
+            assert_eq!(bundled_host_version(&scratch.0), None);
         }
     }
 

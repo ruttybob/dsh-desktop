@@ -6,11 +6,16 @@
  * is served, then terminate the host and exit 0.
  *
  * Prefers the assembled bundle (`src-tauri/resources/host/`, the exact shipped
- * artifact) when present, falling back to the checkout's `host/` directory
- * (fast CI path that skips the Node download).
+ * artifact) when present, falling back to the checkout's `host/` directory.
+ * Set `DSH_DESKTOP_REQUIRE_BUNDLE=1` to forbid the fallback: without a
+ * complete bundle the test fails instead of silently exercising the checkout.
+ *
+ * Sidecar output echoes into this log line-by-line and token-redacted — the
+ * ready URL carries the bearer launch token, so raw chunks are never written.
  *
  * Usage: node scripts/smoke-host.mjs   (from the repo root)
  * Env:   DSH_DESKTOP_SMOKE_TIMEOUT_MS  default 120000
+ *        DSH_DESKTOP_REQUIRE_BUNDLE    "1" forbids the checkout fallback
  */
 import { existsSync, mkdtempSync } from 'node:fs'
 import { spawn } from 'node:child_process'
@@ -27,6 +32,14 @@ const useBundled = existsSync(join(bundled, 'node_modules')) && existsSync(join(
 const nodeRuntimeRel = process.platform === 'win32' ? join('node.exe') : join('bin', 'node')
 const nodeBin = useBundled ? join(bundled, 'node', nodeRuntimeRel) : process.execPath
 const hostEntry = useBundled ? join(bundled, 'main.mjs') : join(root, 'host', 'main.mjs')
+
+// The checkout fallback exists for fast local loops; CI (and anyone asserting
+// the shipped artifact) forbids it so a stale or missing bundle fails loudly.
+const requireBundle = process.env.DSH_DESKTOP_REQUIRE_BUNDLE === '1'
+if (requireBundle && !useBundled) {
+  console.error('[smoke] DSH_DESKTOP_REQUIRE_BUNDLE=1 but src-tauri/resources/host is incomplete — run `npm run host:bundle`')
+  process.exit(1)
+}
 
 // Capture the whole first whitespace token after the `dsh web:` marker, so a
 // query string (`?token=...`) is preserved rather than truncated at the port.
@@ -58,9 +71,15 @@ const timer = setTimeout(() => {
   process.exit(1)
 }, timeoutMs)
 
+// Sidecar output echoes line-by-line and token-redacted: a chunk boundary can
+// split a `token=` value, so a trailing partial line waits for its newline and
+// raw chunks are never written.
+let stdoutForwarded = 0
+let stderrForwarded = 0
+
 child.stdout.on('data', (chunk) => {
   stdout += chunk.toString()
-  process.stdout.write(chunk)
+  stdoutForwarded = forwardRedacted(stdout, stdoutForwarded, process.stdout)
   const match = URL_LINE.exec(stdout)
   if (match !== null && url === undefined) {
     url = match[1]
@@ -69,7 +88,7 @@ child.stdout.on('data', (chunk) => {
 })
 child.stderr.on('data', (chunk) => {
   stderr += chunk.toString()
-  process.stderr.write(chunk)
+  stderrForwarded = forwardRedacted(stderr, stderrForwarded, process.stderr)
 })
 child.on('exit', (code, signal) => {
   if (url === undefined && Date.now() < deadline) {
@@ -148,6 +167,22 @@ async function fetchIndex(tokenizedUrl) {
 // still used for the actual network requests.
 function redactUrlForLog(value) {
   return value.replace(/token=[^&\s]*/, 'token=[redacted]')
+}
+
+// Forward every complete line of `full` past offset `forwarded`, token-
+// redacted. Returns the new offset; a trailing partial line stays buffered.
+function forwardRedacted(full, forwarded, stream) {
+  const pending = full.slice(forwarded)
+  const cut = pending.lastIndexOf('\n')
+  if (cut === -1) return forwarded
+  stream.write(redactTokenInLine(pending.slice(0, cut + 1)))
+  return forwarded + cut + 1
+}
+
+// Mirror `redact_token` in src-tauri/src/host.rs: mask every `token=` value
+// up to the next query delimiter, whitespace, or end of line.
+function redactTokenInLine(text) {
+  return text.replace(/token=[^&\s]*/g, 'token=[redacted]')
 }
 
 function getFirstCookie(res) {
