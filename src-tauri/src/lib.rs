@@ -8,6 +8,7 @@
 //! and spawns its own sidecar on its own OS-assigned port (origins behavior,
 //! ADR-0004) — no forwarding, no refusal.
 
+mod cookie_proxy;
 mod host;
 
 use tauri::Manager;

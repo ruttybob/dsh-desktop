@@ -15,7 +15,6 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
-use tauri::webview::Cookie;
 use tauri::{AppHandle, Manager, Url, WebviewWindow};
 
 /// Owns the host child process; `stop()` is called on app exit.
@@ -127,9 +126,10 @@ impl HostManager {
                     match Url::parse(&url) {
                         Ok(url) => {
                             log::info!("[host] navigating to {}", redact_token(url.as_str()));
-                            inject_browser_session_cookie(&url, &window);
-                            if let Err(error) = window.navigate(url) {
-                                log::error!("[host] navigate failed: {error}");
+                            if let Err(fallback) = navigate_through_cookie_proxy(&url, &window) {
+                                if let Err(error) = window.navigate(fallback) {
+                                    log::error!("[host] navigate failed: {error}");
+                                }
                             }
                         }
                         Err(error) => log::error!("[host] malformed URL line: {error}"),
@@ -159,41 +159,51 @@ impl HostManager {
     }
 }
 
-/// Mint the browser-session cookie out-of-band and inject it into the
-/// WebView's cookie store before the ready-line navigation lands.
+/// Navigate the WebView to the sidecar through the loopback cookie-injecting
+/// proxy (`cookie_proxy`).
 ///
-/// Why: the harness mints the cookie on a 303 response to the tokenized root
-/// request, and WKWebView has been observed to lose a `Set-Cookie` that
-/// arrives on an instant local redirect — the window then strands on the
-/// harness `401` page ("dsh web authentication required"). The smoke test's
-/// token→cookie dance over plain HTTP is immune to that, so the shell runs
-/// the same dance here (GET the tokenized URL, never following redirects),
-/// captures the `Set-Cookie` pair, and places it into the WebView cookie
-/// store directly. The tokenized navigation still runs afterwards: the server
-/// simply re-mints, and if injection failed the old browser-side path
-/// remains as the fallback.
+/// Why: the harness mints the browser-session cookie on a 303 response to the
+/// tokenized root request, and WebKit has been observed never to send that
+/// cookie back on subsequent requests — the window then strands on the
+/// harness `401` page ("dsh web authentication required"), no matter whether
+/// the cookie arrived via the redirect or was injected into the WebView
+/// cookie store. The smoke test's token→cookie dance over plain HTTP is
+/// immune to that, so the shell runs the same dance here (GET the tokenized
+/// URL, never following redirects) and fronts the sidecar with a proxy that
+/// attaches the minted cookie to every request. The WebView never touches
+/// authentication again.
 ///
-/// The captured value is a bearer-equivalent session secret and is never
-/// logged. A session-scoped cookie is injected deliberately: the sidecar's
-/// port is OS-assigned, so no cookie may outlive this launch (spec dsh-u3m.7,
-/// US#10).
-fn inject_browser_session_cookie(url: &Url, window: &WebviewWindow) {
+/// On any failure the `Err` carries the original tokenized URL so the caller
+/// falls back to the plain browser-side mint path. The minted value is a
+/// bearer-equivalent session secret and is never logged.
+fn navigate_through_cookie_proxy(url: &Url, window: &WebviewWindow) -> Result<(), Url> {
     let (name, value) = match mint_browser_session_cookie(url) {
         Ok(pair) => pair,
         Err(error) => {
             log::warn!("[host] browser-session cookie not minted: {error}");
-            return;
+            return Err(url.clone());
         }
     };
-    let Some(domain) = url.host_str() else {
-        return;
+    let sidecar_port = url.port_or_known_default().unwrap_or(80);
+    let proxy_port = match crate::cookie_proxy::spawn(sidecar_port, format!("{name}={value}")) {
+        Ok(proxy_port) => proxy_port,
+        Err(error) => {
+            log::warn!("[host] cookie proxy not started: {error}");
+            return Err(url.clone());
+        }
     };
-    let cookie = Cookie::build((name, value))
-        .domain(domain.to_string())
-        .path("/")
-        .build();
-    if let Err(error) = window.set_cookie(cookie) {
-        log::warn!("[host] cookie injection failed: {error}");
+    // The navigation target is the PROXY origin (same loopback host, proxy
+    // port, clean root) — the proxy attaches the minted cookie to every
+    // request it forwards to the sidecar.
+    let target = Url::parse(&format!("http://127.0.0.1:{proxy_port}/"))
+        .map_err(|_| url.clone())?;
+    log::info!("[host] navigating via cookie proxy on 127.0.0.1:{proxy_port}");
+    match window.navigate(target) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            log::warn!("[host] proxied navigation failed: {error}");
+            Err(url.clone())
+        }
     }
 }
 
