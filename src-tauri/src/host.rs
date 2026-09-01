@@ -106,11 +106,10 @@ impl HostManager {
         surface_version(&window, version);
 
         // stderr reader: forward everything (harness logs, boot errors),
-        // token-redacted like stdout — host output must never carry the
-        // bearer launch token into the log.
+        // redacted like stdout (see `log_redacted`).
         thread::spawn(move || {
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                log::info!("[host] {}", redact_token(&line));
+                log_redacted(&line);
             }
         });
 
@@ -119,7 +118,7 @@ impl HostManager {
         // URL keeps the launch token.
         thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                log::info!("[host] {}", redact_token(&line));
+                log_redacted(&line);
                 if let Some(url) = parse_url_line(&line) {
                     match Url::parse(&url) {
                         Ok(url) => {
@@ -436,6 +435,12 @@ fn redact_token(line: &str) -> String {
     result
 }
 
+/// Every host-output line that reaches the log passes through here: the
+/// launch token is a bearer secret, so redaction happens before logging.
+fn log_redacted(line: &str) {
+    log::info!("[host] {}", redact_token(line));
+}
+
 #[cfg(test)]
 mod tests {
     use super::{parse_url_line, redact_token};
@@ -544,6 +549,90 @@ mod tests {
                 resolve_in_path(&plain_only.display().to_string(), "absent"),
                 None
             );
+        }
+    }
+
+    mod bundled_host_version {
+        use super::super::bundled_host_version;
+        use std::path::{Path, PathBuf};
+
+        /// A unique scratch host root that cleans itself up, safe under
+        /// parallel runs.
+        struct Scratch(PathBuf);
+
+        impl Scratch {
+            fn new(tag: &str) -> Self {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_nanos())
+                    .unwrap_or_default();
+                let dir = std::env::temp_dir().join(format!(
+                    "dsh-desktop-host-version-{tag}-{}-{nanos}",
+                    std::process::id(),
+                ));
+                std::fs::create_dir_all(&dir).expect("create scratch root");
+                Self(dir)
+            }
+        }
+
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        /// Lay down the bundled-host manifest the extraction scans.
+        fn write_manifest(host_dir: &Path, body: &str) {
+            let package_dir = host_dir
+                .join("node_modules")
+                .join("@deepseek-ai")
+                .join("dsh");
+            std::fs::create_dir_all(&package_dir).expect("mkdir package dir");
+            std::fs::write(package_dir.join("package.json"), body).expect("write manifest");
+        }
+
+        #[test]
+        fn extracts_the_bundled_manifest_version() {
+            let scratch = Scratch::new("basic");
+            write_manifest(
+                &scratch.0,
+                r#"{"name":"@deepseek-ai/dsh","version":"1.2.3-beta.4"}"#,
+            );
+            assert_eq!(
+                bundled_host_version(&scratch.0),
+                Some("1.2.3-beta.4".to_string())
+            );
+        }
+
+        #[test]
+        fn grabs_the_first_version_marker_even_when_not_top_level() {
+            // The extraction is a plain scan, not a JSON walk: the first
+            // `"version":` marker wins even when it is a nested key (here a
+            // devDependencies-style object) rather than the manifest's
+            // top-level field. This pins the current behavior so a stricter
+            // extraction would be a conscious change.
+            let scratch = Scratch::new("first-match");
+            write_manifest(
+                &scratch.0,
+                r#"{"devDependencies":{"version":"2.0.0-rc.1"},"version":"1.2.3"}"#,
+            );
+            assert_eq!(
+                bundled_host_version(&scratch.0),
+                Some("2.0.0-rc.1".to_string())
+            );
+        }
+
+        #[test]
+        fn returns_none_when_the_manifest_is_missing() {
+            let scratch = Scratch::new("missing");
+            assert_eq!(bundled_host_version(&scratch.0), None);
+        }
+
+        #[test]
+        fn returns_none_for_an_empty_version_value() {
+            let scratch = Scratch::new("empty");
+            write_manifest(&scratch.0, r#"{"name":"@deepseek-ai/dsh","version":""}"#);
+            assert_eq!(bundled_host_version(&scratch.0), None);
         }
     }
 
