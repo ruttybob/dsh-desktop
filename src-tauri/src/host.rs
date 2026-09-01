@@ -141,6 +141,7 @@ impl HostManager {
     /// state on disk, so no graceful shutdown is required).
     pub fn stop(&self) {
         if let Some(mut child) = self.child.lock().expect("host child lock").take() {
+            log::info!("[host] stopping sidecar pid {}", child.id());
             // Kill the host's whole process group (Unix): direct-child kill
             // alone leaves any host descendants running as orphans.
             #[cfg(unix)]
@@ -149,6 +150,7 @@ impl HostManager {
             }
             let _ = child.kill();
             let _ = child.wait();
+            log::info!("[host] sidecar stopped");
         }
     }
 }

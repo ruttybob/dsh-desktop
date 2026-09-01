@@ -42,10 +42,26 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building dsh-desktop")
         .run(|app_handle, event| {
-            if let tauri::RunEvent::Exit = event {
-                if let Some(manager) = app_handle.try_state::<host::HostManager>() {
-                    manager.stop();
+            // The sidecar must die on EVERY graceful exit path. Empirically
+            // (2026-09-01, macOS): closing the last window tears the run loop
+            // down WITHOUT delivering RunEvent::Exit — the sidecar survived
+            // as an orphan (ppid 1). ExitRequested covers the window-close
+            // path; Exit covers direct app.exit()/terminate paths that skip
+            // ExitRequested. stop() is idempotent (the child is taken out of
+            // the manager), so handling both is safe.
+            match event {
+                tauri::RunEvent::ExitRequested { .. } => {
+                    log::info!("[launch] exit requested; stopping sidecar");
+                    if let Some(manager) = app_handle.try_state::<host::HostManager>() {
+                        manager.stop();
+                    }
                 }
+                tauri::RunEvent::Exit => {
+                    if let Some(manager) = app_handle.try_state::<host::HostManager>() {
+                        manager.stop();
+                    }
+                }
+                _ => {}
             }
         });
 }
