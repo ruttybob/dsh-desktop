@@ -847,13 +847,10 @@ dependencies = [
  "dirs",
  "libc",
  "log",
- "serde",
- "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-log",
  "tauri-plugin-single-instance",
- "url",
 ]
 
 [[package]]

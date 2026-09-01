@@ -22,13 +22,7 @@ pub struct HostManager {
 
 impl HostManager {
     /// Locate the bundled host and spawn it. Returns a manager even when the
-    /// spawn failed (the window stays on the splash; logs explain why).
-    ///
-    /// Currently unreachable from launch resolution: splash replaced the
-    /// sidecar in the no-signal case (dsh-df4 AC1). Retained intact as the
-    /// classic sidecar launch path (behind `allow(dead_code)`, which also
-    /// keeps its private helper chain lint-clean).
-    #[allow(dead_code)]
+    /// spawn failed (the window stays on the loading screen; logs explain why).
     pub fn spawn(app: AppHandle, window: WebviewWindow) -> Self {
         let host_dirs = resolve_host_dirs(&app);
         let Some(host_dir) = host_dirs.iter().find(|dir| dir.join("main.mjs").exists()) else {
@@ -102,6 +96,15 @@ impl HostManager {
             child: Mutex::new(Some(child)),
         };
 
+        // Surface the bundled harness release on the loading screen (and in
+        // the log) so the user always knows which build is booting.
+        let version = bundled_host_version(host_dir);
+        log::info!(
+            "[host] bundled harness version: {}",
+            version.as_deref().unwrap_or("unknown")
+        );
+        surface_version(&window, version);
+
         // stderr reader: forward everything (harness logs, boot errors).
         thread::spawn(move || {
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
@@ -132,14 +135,6 @@ impl HostManager {
         manager
     }
 
-    /// True while a sidecar child is running. `stop()` only takes the child
-    /// out of the manager — the managed state itself stays registered — so
-    /// callers that must distinguish "sidecar alive" from "stopped, now
-    /// attaching" use this instead of mere state existence.
-    pub fn is_running(&self) -> bool {
-        self.child.lock().expect("host child lock").is_some()
-    }
-
     /// Terminate the host process (hard kill; the harness persists its own
     /// state on disk, so no graceful shutdown is required).
     pub fn stop(&self) {
@@ -154,6 +149,51 @@ impl HostManager {
             let _ = child.wait();
         }
     }
+}
+
+/// The bundled harness release version: the `version` field of
+/// `@deepseek-ai/dsh/package.json` inside the bundle. A missing or
+/// unreadable manifest yields `None` (the version line is then "unknown");
+/// extraction is a plain scan, so no JSON dependency is kept for this.
+fn bundled_host_version(host_dir: &Path) -> Option<String> {
+    let manifest = host_dir
+        .join("node_modules")
+        .join("@deepseek-ai/dsh")
+        .join("package.json");
+    let raw = std::fs::read_to_string(manifest).ok()?;
+    let marker = "\"version\":";
+    let at = raw.find(marker)? + marker.len();
+    let rest = raw[at..].trim_start();
+    let value = rest.strip_prefix('"')?;
+    let end = value.find('"')?;
+    let version = &value[..end];
+    (!version.is_empty()).then(|| version.to_string())
+}
+
+/// Show the bundled harness version on the loading screen ("loading-screen
+/// line or log" — the log always gets it in `spawn`). The screen is static
+/// HTML, so the version is patched into its `#status` line shortly after
+/// setup; by then the page's DOM is long since ready. A character whitelist
+/// on the version keeps the injected JS literal inert.
+fn surface_version(window: &WebviewWindow, version: Option<String>) {
+    let Some(version) = version else {
+        return;
+    };
+    let safe: String = version
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+' | '_'))
+        .collect();
+    let window = window.clone();
+    thread::spawn(move || {
+        thread::sleep(std::time::Duration::from_millis(600));
+        let script = format!(
+            "const s = document.getElementById('status'); \
+             if (s) {{ s.textContent = '正在启动主机服务 v{safe}…'; }}"
+        );
+        if let Err(error) = window.eval(&script) {
+            log::warn!("[host] version line on the loading screen failed: {error}");
+        }
+    });
 }
 
 /// Candidate host roots: bundled resource layouts (prod + dev) and the source tree.
@@ -377,8 +417,8 @@ fn parse_url_line(line: &str) -> Option<String> {
 /// whitespace, or end of string) with `token=[redacted]`. Applied to host
 /// stdout before it reaches the log: the launch token is a bearer secret and
 /// the unredacted URL must live only in memory, used solely for navigation.
-/// `pub(crate)`: every module that logs an attach-related URL or argv
-/// (splash, stub, lib single-instance forwarding) applies the same redaction.
+/// `pub(crate)`: the single-instance callback in lib.rs applies the same
+/// redaction to a refused second instance's argv.
 pub(crate) fn redact_token(line: &str) -> String {
     const MARKER: &str = "token=";
     let mut result = String::with_capacity(line.len());
