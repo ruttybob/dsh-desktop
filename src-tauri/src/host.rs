@@ -105,10 +105,12 @@ impl HostManager {
         );
         surface_version(&window, version);
 
-        // stderr reader: forward everything (harness logs, boot errors).
+        // stderr reader: forward everything (harness logs, boot errors),
+        // token-redacted like stdout — host output must never carry the
+        // bearer launch token into the log.
         thread::spawn(move || {
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                log::info!("[host] {line}");
+                log::info!("[host] {}", redact_token(&line));
             }
         });
 
@@ -413,13 +415,13 @@ fn parse_url_line(line: &str) -> Option<String> {
     Some(format!("http://127.0.0.1:{token}"))
 }
 
-/// Replace every `token=<value>` occurrence (value runs to the next `&`,
-/// whitespace, or end of string) with `token=[redacted]`. Applied to host
-/// stdout before it reaches the log: the launch token is a bearer secret and
-/// the unredacted URL must live only in memory, used solely for navigation.
-/// `pub(crate)`: the single-instance callback in lib.rs applies the same
-/// redaction to a refused second instance's argv.
-pub(crate) fn redact_token(line: &str) -> String {
+/// Internal helper: replace every `token=<value>` occurrence (value runs to
+/// the next `&`, whitespace, or end of string) with `token=[redacted]`. Every
+/// host-output line that reaches the log passes through it — the stdout
+/// ready-line/URL lines and the stderr forward alike — because the launch
+/// token is a bearer secret: the unredacted URL lives only in memory, used
+/// solely for navigation.
+fn redact_token(line: &str) -> String {
     const MARKER: &str = "token=";
     let mut result = String::with_capacity(line.len());
     let mut rest = line;

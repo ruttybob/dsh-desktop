@@ -3,7 +3,10 @@
 //! runtime + `@deepseek-ai/dsh`), follows the `dsh web: http://127.0.0.1:<port>`
 //! ready line into the WebView (host.rs + the loading screen ui/index.html),
 //! and kills the sidecar process group on exit. No user-installed dsh is
-//! discovered, adopted, or spawned; no connect UI exists.
+//! discovered, adopted, or spawned; no connect UI exists. There is no
+//! single-instance guard either: a second app instance opens its own window
+//! and spawns its own sidecar on its own OS-assigned port (origins behavior,
+//! ADR-0004) — no forwarding, no refusal.
 
 mod host;
 
@@ -12,18 +15,6 @@ use tauri::Manager;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        // Single-instance guard MUST be the first plugin registered (per the
-        // plugin docs): it claims the identity socket early so a second launch
-        // is refused before any other plugin/setup can spawn the sidecar. The
-        // guard is also the only protection against two sidecars racing
-        // ~/.dsh/storages with last-write-wins. There is deliberately no
-        // relaunch forwarding: the second instance is only logged (its argv
-        // redacted — command lines may carry tokens).
-        .plugin(tauri_plugin_single_instance::init(|_app, argv, _cwd| {
-            let redacted_argv: Vec<String> =
-                argv.iter().map(|arg| host::redact_token(arg)).collect();
-            log::info!("[single-instance] second instance refused; argv: {redacted_argv:?}");
-        }))
         .plugin(tauri_plugin_log::Builder::new().build())
         .setup(|app| {
             let window = app

@@ -14,11 +14,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-# Pinned to 2.4.3 per the dsh-nbe spec: the version with full macOS support
-# (unix-socket identity). It pulls tauri ^2.10, so tauri is bumped to match.
 tauri = { version = "2.10", features = [] }
 tauri-plugin-log = "2"
-tauri-plugin-single-instance = "=2.4.3"
 log = "0.4"
 dirs = "6"
 
