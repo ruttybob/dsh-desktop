@@ -23,6 +23,12 @@ pub struct HostManager {
 impl HostManager {
     /// Locate the bundled host and spawn it. Returns a manager even when the
     /// spawn failed (the window stays on the splash; logs explain why).
+    ///
+    /// Currently unreachable from launch resolution: splash replaced the
+    /// sidecar in the no-signal case (dsh-df4 AC1). Retained intact as the
+    /// classic sidecar launch path (behind `allow(dead_code)`, which also
+    /// keeps its private helper chain lint-clean).
+    #[allow(dead_code)]
     pub fn spawn(app: AppHandle, window: WebviewWindow) -> Self {
         let host_dirs = resolve_host_dirs(&app);
         let Some(host_dir) = host_dirs.iter().find(|dir| dir.join("main.mjs").exists()) else {
@@ -124,6 +130,14 @@ impl HostManager {
         });
 
         manager
+    }
+
+    /// True while a sidecar child is running. `stop()` only takes the child
+    /// out of the manager — the managed state itself stays registered — so
+    /// callers that must distinguish "sidecar alive" from "stopped, now
+    /// attaching" use this instead of mere state existence.
+    pub fn is_running(&self) -> bool {
+        self.child.lock().expect("host child lock").is_some()
     }
 
     /// Terminate the host process (hard kill; the harness persists its own
@@ -363,7 +377,9 @@ fn parse_url_line(line: &str) -> Option<String> {
 /// whitespace, or end of string) with `token=[redacted]`. Applied to host
 /// stdout before it reaches the log: the launch token is a bearer secret and
 /// the unredacted URL must live only in memory, used solely for navigation.
-fn redact_token(line: &str) -> String {
+/// `pub(crate)`: every module that logs an attach-related URL or argv
+/// (splash, stub, lib single-instance forwarding) applies the same redaction.
+pub(crate) fn redact_token(line: &str) -> String {
     const MARKER: &str = "token=";
     let mut result = String::with_capacity(line.len());
     let mut rest = line;
