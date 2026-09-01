@@ -16,6 +16,17 @@ use tauri::Manager;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_log::Builder::new().build())
+        // Deterministic loading-screen version line: patch `#status` when the
+        // loading page has Finished loading its DOM — no delay to guess. The
+        // URL guard keeps the patch off the harness page the ready line
+        // navigates to later.
+        .on_page_load(|webview, payload| {
+            if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished)
+                && payload.url().as_str().contains("index.html")
+            {
+                host::surface_version(webview);
+            }
+        })
         .setup(|app| {
             let window = app
                 .get_webview_window("main")

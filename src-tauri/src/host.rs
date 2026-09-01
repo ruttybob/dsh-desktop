@@ -96,14 +96,15 @@ impl HostManager {
             child: Mutex::new(Some(child)),
         };
 
-        // Surface the bundled harness release on the loading screen (and in
-        // the log) so the user always knows which build is booting.
+        // Surface the bundled harness release in the log at boot so the user
+        // always knows which build is booting; the loading-screen line is
+        // patched by the page-load hook (lib.rs) once the page's DOM is
+        // deterministically ready.
         let version = bundled_host_version(host_dir);
         log::info!(
             "[host] bundled harness version: {}",
             version.as_deref().unwrap_or("unknown")
         );
-        surface_version(&window, version);
 
         // stderr reader: forward everything (harness logs, boot errors),
         // redacted like stdout (see `log_redacted`).
@@ -152,49 +153,49 @@ impl HostManager {
     }
 }
 
-/// The bundled harness release version: the `version` field of
-/// `@deepseek-ai/dsh/package.json` inside the bundle. A missing or
-/// unreadable manifest yields `None` (the version line is then "unknown");
-/// extraction is a plain scan, so no JSON dependency is kept for this.
+/// The bundled harness release version: the top-level `version` field of
+/// `@deepseek-ai/dsh/package.json` inside the bundle. A missing, unreadable,
+/// or non-JSON manifest yields `None` (the version line is then "unknown").
+/// The manifest is parsed as JSON, so nested `version` keys are ignored and
+/// field spacing is irrelevant — only the manifest's own field counts.
 fn bundled_host_version(host_dir: &Path) -> Option<String> {
     let manifest = host_dir
         .join("node_modules")
         .join("@deepseek-ai/dsh")
         .join("package.json");
     let raw = std::fs::read_to_string(manifest).ok()?;
-    let marker = "\"version\":";
-    let at = raw.find(marker)? + marker.len();
-    let rest = raw[at..].trim_start();
-    let value = rest.strip_prefix('"')?;
-    let end = value.find('"')?;
-    let version = &value[..end];
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let version = value.get("version")?.as_str()?;
     (!version.is_empty()).then(|| version.to_string())
 }
 
-/// Show the bundled harness version on the loading screen ("loading-screen
-/// line or log" — the log always gets it in `spawn`). The screen is static
-/// HTML, so the version is patched into its `#status` line shortly after
-/// setup; by then the page's DOM is long since ready. A character whitelist
-/// on the version keeps the injected JS literal inert.
-fn surface_version(window: &WebviewWindow, version: Option<String>) {
-    let Some(version) = version else {
+/// Patch the bundled harness version into the loading screen's `#status`
+/// line ("loading-screen line or log" — the log always gets it in `spawn`).
+/// Called from the page-load hook in lib.rs when the loading page has
+/// finished loading its DOM — deterministic, no delay to guess. The URL
+/// guard there keeps this off the harness page the ready line navigates to.
+/// A character whitelist on the version keeps the injected JS literal inert.
+pub(crate) fn surface_version(webview: &tauri::Webview<tauri::Wry>) {
+    let Some(host_dir) = resolve_host_dirs(webview.app_handle())
+        .into_iter()
+        .find(|dir| dir.join("main.mjs").exists())
+    else {
+        return;
+    };
+    let Some(version) = bundled_host_version(&host_dir) else {
         return;
     };
     let safe: String = version
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+' | '_'))
         .collect();
-    let window = window.clone();
-    thread::spawn(move || {
-        thread::sleep(std::time::Duration::from_millis(600));
-        let script = format!(
-            "const s = document.getElementById('status'); \
-             if (s) {{ s.textContent = 'Starting the sidecar host v{safe}…'; }}"
-        );
-        if let Err(error) = window.eval(&script) {
-            log::warn!("[host] version line on the loading screen failed: {error}");
-        }
-    });
+    let script = format!(
+        "const s = document.getElementById('status'); \
+         if (s) {{ s.textContent = 'Starting the sidecar host v{safe}…'; }}"
+    );
+    if let Err(error) = webview.eval(&script) {
+        log::warn!("[host] version line on the loading screen failed: {error}");
+    }
 }
 
 /// Candidate host roots: bundled resource layouts (prod + dev) and the source tree.
@@ -605,21 +606,35 @@ mod tests {
         }
 
         #[test]
-        fn grabs_the_first_version_marker_even_when_not_top_level() {
-            // The extraction is a plain scan, not a JSON walk: the first
-            // `"version":` marker wins even when it is a nested key (here a
-            // devDependencies-style object) rather than the manifest's
-            // top-level field. This pins the current behavior so a stricter
-            // extraction would be a conscious change.
-            let scratch = Scratch::new("first-match");
+        fn ignores_nested_version_fields() {
+            // Only the manifest's top-level `version` field counts: a nested
+            // key (here a devDependencies-style object) must not be picked up
+            // no matter where it sits in the document.
+            let scratch = Scratch::new("nested");
             write_manifest(
                 &scratch.0,
                 r#"{"devDependencies":{"version":"2.0.0-rc.1"},"version":"1.2.3"}"#,
             );
             assert_eq!(
                 bundled_host_version(&scratch.0),
-                Some("2.0.0-rc.1".to_string())
+                Some("1.2.3".to_string())
             );
+        }
+
+        #[test]
+        fn parses_the_manifest_regardless_of_field_spacing() {
+            // The manifest is parsed as JSON, not scanned for a marker, so
+            // spacing around the colon cannot hide the field.
+            let scratch = Scratch::new("spacing");
+            write_manifest(&scratch.0, r#"{ "name" : "@deepseek-ai/dsh" , "version" : "1.2.3" }"#);
+            assert_eq!(bundled_host_version(&scratch.0), Some("1.2.3".to_string()));
+        }
+
+        #[test]
+        fn returns_none_for_a_non_json_manifest() {
+            let scratch = Scratch::new("non-json");
+            write_manifest(&scratch.0, "not json at all");
+            assert_eq!(bundled_host_version(&scratch.0), None);
         }
 
         #[test]

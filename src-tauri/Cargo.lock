@@ -694,6 +694,7 @@ dependencies = [
  "dirs",
  "libc",
  "log",
+ "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-log",
