@@ -2,227 +2,231 @@
 
 # dsh-desktop
 
-**DeepSeek Harness 桌面客户端** — 基于 [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 的 Tauri 原生窗口封装
+**DeepSeek Harness desktop client** — a Tauri native window wrapper around [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)
 
 [![Release](https://img.shields.io/github/v/release/kyorakuyk/dsh-desktop?label=release)](https://github.com/kyorakuyk/dsh-desktop/releases/latest)
 [![CI](https://img.shields.io/github/actions/workflow/status/kyorakuyk/dsh-desktop/ci.yml?label=ci)](https://github.com/kyorakuyk/dsh-desktop/actions/workflows/ci.yml)
 [![License](https://img.shields.io/github/license/kyorakuyk/dsh-desktop)](LICENSE)
 [![Topic](https://img.shields.io/badge/topic-dsh--plugin-blue)](#)
 
-Windows · macOS · Linux — 开箱即用，无需安装 Node.js
+Windows · macOS · Linux — works out of the box, no Node.js installation required
+
+[Русская версия](README.ru.md)
 
 </div>
 
 ---
 
-## 这是什么
+## What is this
 
-dsh-desktop 把 DeepSeek Harness 的 Web GUI（`dsh web`）装进原生桌面窗口：
+dsh-desktop puts the DeepSeek Harness Web GUI (`dsh web`) inside a native desktop window:
 
-- **Tauri 2 (Rust) 壳**负责窗口、主机进程生命周期与打包；
-- **内嵌 Node.js 主机（sidecar）**运行 npm 上发布的 [`@deepseek-ai/dsh`](https://www.npmjs.com/package/@deepseek-ai/dsh)（`dsh web --port 0`）；
-- **WebView 直接访问 `http://127.0.0.1:<随机端口>`**，完整复用 harness 的
-  `window.__DSH_BOOT__` 注入、插件 bundle 服务、`/api` JSON-RPC 与 WebSocket 事件下行——**不改动 deepseek-harness 一行代码**。
+- A **Tauri 2 (Rust) shell** handles the window, host process lifecycle, and packaging;
+- An **embedded Node.js host (sidecar)** runs [`@deepseek-ai/dsh`](https://www.npmjs.com/package/@deepseek-ai/dsh) published on npm (`dsh web --port 0`);
+- **The WebView loads `http://127.0.0.1:<random port>` directly**, fully reusing the harness's
+  `window.__DSH_BOOT__` injection, plugin bundle serving, `/api` JSON-RPC, and WebSocket event stream — **without changing a single line of deepseek-harness**.
 
-安装包自带 Node 运行时与全部 harness 依赖，用户机器上无需预装任何运行时。
+The installer bundles the Node runtime and all harness dependencies, so no runtime needs to be preinstalled on the user's machine.
 
-## ✨ 功能特性
+## ✨ Features
 
-| 能力 | 说明 |
+| Capability | Description |
 | --- | --- |
-| 🖥️ 原生窗口 | Windows WebView2 / macOS WKWebView / Linux WebKitGTK |
-| 📦 零依赖安装 | 安装包内置 Node 运行时 + `@deepseek-ai/dsh` 全家桶 |
-| 🔌 完整 harness 能力 | 会话、工具调用、插件、模型配置、工作区等与 `dsh web` 完全一致 |
-| 🚀 即开即用 | 启动闪屏 → 主机装配（约 30 个插件行）→ 自动进入 GUI |
-| 🤖 模型配置 | GUI 内 设置 → 模型 直接配置 API Key |
-| 🔄 跨平台发布 | GitHub Actions 标签一键构建三平台安装包并发布 Releases |
-| 📋 日志落地 | 主机与壳日志统一输出（tauri-plugin-log） |
+| 🖥️ Native window | Windows WebView2 / macOS WKWebView / Linux WebKitGTK |
+| 📦 Zero-dependency install | The installer ships a Node runtime + the full `@deepseek-ai/dsh` stack |
+| 🔌 Full harness capabilities | Sessions, tool calls, plugins, model config, workspace — identical to `dsh web` |
+| 🚀 Ready on launch | Splash screen → host assembly (~30 plugin lines) → straight into the GUI |
+| 🤖 Model config | Configure your API key in the GUI under Settings → Model |
+| 🔄 Cross-platform releases | GitHub Actions builds installers for all three platforms on tag and publishes to Releases |
+| 📋 Logging | Host and shell logs are written through a unified pipeline (tauri-plugin-log) |
 
-## 📥 下载安装
+## 📥 Download & install
 
-从 [Releases](https://github.com/kyorakuyk/dsh-desktop/releases/latest) 下载对应平台的安装包：
+Download the installer for your platform from [Releases](https://github.com/kyorakuyk/dsh-desktop/releases/latest):
 
-| 平台 | 文件 | 说明 |
+| Platform | File | Notes |
 | --- | --- | --- |
-| Windows | `dsh-desktop_<version>_x64-setup.exe` | NSIS 安装器，双击安装 |
-| macOS (Apple Silicon) | `dsh-desktop_<version>_aarch64.dmg` | 拖入 Applications 即可 |
-| macOS (Intel) | `dsh-desktop_<version>_x64.dmg` | 同上 |
-| Linux | `dsh-desktop_<version>_amd64.deb` | Debian / Ubuntu：`sudo dpkg -i` |
-| Linux | `dsh-desktop-<version>-1.x86_64.rpm` | Fedora / RHEL：`sudo rpm -i` |
+| Windows | `dsh-desktop_<version>_x64-setup.exe` | NSIS installer, double-click to install |
+| macOS (Apple Silicon) | `dsh-desktop_<version>_aarch64.dmg` | Drag into Applications |
+| macOS (Intel) | `dsh-desktop_<version>_x64.dmg` | Same as above |
+| Linux | `dsh-desktop_<version>_amd64.deb` | Debian / Ubuntu: `sudo dpkg -i` |
+| Linux | `dsh-desktop-<version>-1.x86_64.rpm` | Fedora / RHEL: `sudo rpm -i` |
 
-> **首次使用**：启动后等待数秒（主机装配），在 设置 → 模型 中配置 API Key 即可开始对话。
-> 数据默认存放在 `~/.dsh`（会话、设置、profile；与 dsh CLI 共用）。
+> **First run**: wait a few seconds after launch (host assembly), then set your API key under Settings → Model to start chatting.
+> Data is stored in `~/.dsh` by default (sessions, settings, profile; shared with the dsh CLI).
 
-## 🏗️ 架构
+## 🏗️ Architecture
 
 ```
 ┌─────────────────────────────────────────────┐
-│ Tauri 窗口 (WebView2 / WKWebView)           │
-│  └─ 加载 http://127.0.0.1:<随机端口>         │
+│ Tauri window (WebView2 / WKWebView)         │
+│  └─ loads http://127.0.0.1:<random port>    │
 ├─────────────────────────────────────────────┤
-│ Rust 壳 (src-tauri)                         │
-│  ├─ 拉起/监控 sidecar，解析 `dsh web:` URL 行│
-│  ├─ 工作目录 ~/.dsh/workspace               │
-│  ├─ 退出时终止主机进程                       │
-│  └─ 日志（tauri-plugin-log）                 │
+│ Rust shell (src-tauri)                      │
+│  ├─ spawns/monitors the sidecar, parses the │
+│  │   `dsh web:` URL line                    │
+│  ├─ working dir ~/.dsh/workspace            │
+│  ├─ terminates the host process on exit     │
+│  └─ logging (tauri-plugin-log)              │
 ├─────────────────────────────────────────────┤
-│ Sidecar：捆绑 Node 运行时 + @deepseek-ai/dsh│
+│ Sidecar: bundled Node runtime + @deepseek-  │
+│ ai/dsh                                      │
 │  └─ node host/main.mjs → dsh web --port 0   │
-│     ├─ __DSH_BOOT__ 注入（dsh-client-modules│
-│     │   节点端扫描 dsh.client 声明）          │
-│     ├─ /plugins/<id>/client.js 插件 bundle   │
-│     ├─ /api JSON-RPC 网关                    │
-│     └─ /api/events.mux|host WebSocket 下行   │
+│     ├─ __DSH_BOOT__ injection (dsh-client-  │
+│     │   modules scans dsh.client on node)   │
+│     ├─ /plugins/<id>/client.js plugin bundle│
+│     ├─ /api JSON-RPC gateway                │
+│     └─ /api/events.mux|host WebSocket stream│
 └─────────────────────────────────────────────┘
 ```
 
-### 启动时序
+### Startup sequence
 
-1. 应用启动，窗口显示**闪屏页**（主机装配期间的加载界面）；
-2. Rust 壳 spawn 捆绑的 `node.exe` → `host/main.mjs` → 进程内执行 `dsh web --port 0`；
-3. `dsh web` 装配 Cordis 插件树（`@deepseek-ai/dsh-base` + `@deepseek-ai/dsh-web-app` 两个 bundle，
-   约 30 个插件行），webserver 绑定到**操作系统分配的随机端口**；
-4. web-app bundle 在 Loader 树稳定后打印 `dsh web: http://127.0.0.1:<port>`；
-5. Rust 壳解析该行 → WebView 导航到该 URL → harness GUI 完整加载
-   （boot manifest、插件 bundle 预取、`/api` 连接、WebSocket 事件下行）；
-6. 用户关闭窗口 → 应用退出 → 主机进程被终止（会话数据已持久化到磁盘）。
+1. The app starts and the window shows the **splash screen** (loading UI while the host assembles);
+2. The Rust shell spawns the bundled `node.exe` → `host/main.mjs` → `dsh web --port 0` runs in that process;
+3. `dsh web` assembles the Cordis plugin tree (the `@deepseek-ai/dsh-base` + `@deepseek-ai/dsh-web-app`
+   bundles, ~30 plugin lines), and the webserver binds to an **OS-assigned random port**;
+4. Once the Loader tree settles, the web-app bundle prints `dsh web: http://127.0.0.1:<port>`;
+5. The Rust shell parses that line → the WebView navigates to the URL → the harness GUI fully loads
+   (boot manifest, plugin bundle prefetch, `/api` connection, WebSocket event stream);
+6. The user closes the window → the app exits → the host process is terminated (session data has already been persisted to disk).
 
-### 工程要点
+### Engineering notes
 
-- **零端口冲突**：`--port 0` 让 OS 分配端口，Rust 从 stdout 解析真实地址；
-- **Windows `\\?\` 前缀**：Tauri 资源路径带扩展长度前缀，Node loader 无法解析，
-  传给子进程前已剥除（`strip_verbatim_prefix`）；
-- **精简 bundle**：pnpm 以 `hoisted` 布局安装（复制后无符号链接），打包时剔除
-  `.pnpm` store（约 250 MB）与 Node 发行包中的 npm/npx/corepack（约 30 MB）；
-- **keyless 冒烟测试**：CI 与本地均可用 `npm run smoke` 验证整条主机链路
-  （启动 → URL 行 → index 200 + shell HTML），无需 API Key。
+- **Zero port conflicts**: `--port 0` lets the OS assign the port; Rust parses the real address from stdout;
+- **Windows `\\?\` prefix**: Tauri resource paths carry the extended-length prefix, which the Node loader cannot resolve;
+  it is stripped before being passed to the child process (`strip_verbatim_prefix`);
+- **Lean bundle**: pnpm installs with a `hoisted` layout (no symlinks after copying); the `.pnpm` store (~250 MB)
+  and npm/npx/corepack from the Node distribution (~30 MB) are excluded at packaging time;
+- **Keyless smoke test**: `npm run smoke` verifies the whole host chain in both CI and locally
+  (start → URL line → index 200 + shell HTML), no API key needed.
 
-## 📁 目录结构
+## 📁 Repository layout
 
 ```
 dsh-desktop/
-├── src-tauri/            # Rust 壳（窗口、sidecar 生命周期、打包配置、图标）
-│   ├── src/host.rs       # sidecar spawn / URL 解析 / 进程终止
-│   ├── src/lib.rs        # Tauri 应用装配与退出钩子
-│   └── resources/        # 构建期组装产物（gitignored）：
+├── src-tauri/            # Rust shell (window, sidecar lifecycle, packaging config, icons)
+│   ├── src/host.rs       # sidecar spawn / URL parsing / process termination
+│   ├── src/lib.rs        # Tauri app assembly and exit hooks
+│   └── resources/        # build-time assembled artifacts (gitignored):
 │                         #   host/{main.mjs, node/, node_modules/}
-├── host/                 # Node 主机入口
-│   ├── main.mjs          # 进程内执行 dsh web（argv 重定向 + file:// 导入）
-│   └── pnpm-workspace.yaml  # pnpm 11 设置（hoisted / allowBuilds / 发布年龄门槛）
+├── host/                 # Node host entry
+│   ├── main.mjs          # runs dsh web in-process (argv redirection + file:// import)
+│   └── pnpm-workspace.yaml  # pnpm 11 settings (hoisted / allowBuilds / publish age gate)
 ├── scripts/
-│   ├── fetch-node.mjs    # 下载官方 Node 运行时（v22 LTS，按平台/架构）
-│   ├── bundle-host.mjs   # 组装 resources/host（剔除 .pnpm 与 npm 发行件）
-│   └── smoke-host.mjs    # keyless 主机冒烟测试（优先测打包产物）
-├── ui/                   # 启动闪屏页（纯静态，无构建步骤）
+│   ├── fetch-node.mjs    # downloads the official Node runtime (v22 LTS, per platform/arch)
+│   ├── bundle-host.mjs   # assembles resources/host (excludes .pnpm and npm dist files)
+│   └── smoke-host.mjs    # keyless host smoke test (prefers packaged artifacts)
+├── ui/                   # splash screen page (pure static, no build step)
 ├── .github/workflows/
-│   ├── release.yml       # 标签 → tauri-action 三平台构建 → GitHub Releases
-│   └── ci.yml            # PR/推送：主机冒烟 + Windows/Linux cargo check
-└── package.json          # 便捷脚本（见下）
+│   ├── release.yml       # tag → tauri-action three-platform build → GitHub Releases
+│   └── ci.yml            # PR/push: host smoke + Windows/Linux cargo check
+└── package.json          # convenience scripts (see below)
 ```
 
-## 🛠️ 开发
+## 🛠️ Development
 
-### 环境要求
+### Prerequisites
 
-| 依赖 | 版本 | 说明 |
+| Dependency | Version | Notes |
 | --- | --- | --- |
-| Node.js | ≥ 22.19 | 含 npm |
-| pnpm | ≥ 11 | 用于安装 host 依赖 |
-| Rust 工具链 | ≥ 1.77 | cargo / rustc |
-| Linux 额外依赖 | — | `libwebkit2gtk-4.1-dev` 等，见 [Tauri 官方文档](https://tauri.app/start/prerequisites/) |
+| Node.js | ≥ 22.19 | includes npm |
+| pnpm | ≥ 11 | used to install host dependencies |
+| Rust toolchain | ≥ 1.77 | cargo / rustc |
+| Extra Linux dependencies | — | `libwebkit2gtk-4.1-dev` etc., see the [Tauri docs](https://tauri.app/start/prerequisites/) |
 
-### 快速开始
+### Quick start
 
 ```sh
-# 1. 安装依赖并组装主机资源（Node 运行时 + @deepseek-ai/dsh 及其依赖）
+# 1. Install dependencies and assemble the host resources (Node runtime + @deepseek-ai/dsh and its deps)
 npm install
-npm run host:install        # 内部: pnpm -C host install --prod
-npm run host:bundle         # 产物: src-tauri/resources/host/（已 gitignore）
+npm run host:install        # internally: pnpm -C host install --prod
+npm run host:bundle         # output: src-tauri/resources/host/ (gitignored)
 
-# 2. 开发运行（打开窗口；主机由 Rust 自动拉起）
+# 2. Run in dev mode (opens the window; the host is spawned by Rust automatically)
 npm run tauri dev
 ```
 
-### 常用脚本
+### Common scripts
 
-| 脚本 | 作用 |
+| Script | Purpose |
 | --- | --- |
-| `npm run host:install` | 安装 host 依赖（`@deepseek-ai/dsh` 固定版本） |
-| `npm run host:fetch-node` | 下载/裁剪官方 Node 运行时 |
-| `npm run host:bundle` | 组装 `src-tauri/resources/host/` |
-| `npm run smoke` | keyless 主机冒烟测试（优先测打包产物） |
-| `npm run tauri dev` | 开发模式运行 |
-| `npm run build` | 生产构建（bundle host + tauri build） |
+| `npm run host:install` | Install host dependencies (`@deepseek-ai/dsh` pinned) |
+| `npm run host:fetch-node` | Download/trim the official Node runtime |
+| `npm run host:bundle` | Assemble `src-tauri/resources/host/` |
+| `npm run smoke` | Keyless host smoke test (prefers packaged artifacts) |
+| `npm run tauri dev` | Run in development mode |
+| `npm run build` | Production build (bundle host + tauri build) |
 
-### 构建安装包
+### Building installers
 
 ```sh
 npm run build
 # Windows: src-tauri/target/release/bundle/nsis/*.exe
 # macOS:   bundle/macos/*.app + bundle/dmg/*.dmg
-# Linux:   bundle/deb/*.deb + bundle/rpm/*.rpm（AppImage 暂缓，见已知限制）
+# Linux:   bundle/deb/*.deb + bundle/rpm/*.rpm (AppImage on hold, see known limitations)
 ```
 
-## 🚀 发布到 GitHub
+## 🚀 Publishing to GitHub
 
-仓库已配置 `.github/workflows/release.yml`。两种触发方式：
+The repo ships with `.github/workflows/release.yml`. Two ways to trigger it:
 
 ```sh
-# 方式一：推送标签（推荐）
+# Option 1: push a tag (recommended)
 git tag v0.2.0
 git push origin v0.2.0
 
-# 方式二：Actions 页面手动触发 release 工作流
+# Option 2: trigger the release workflow manually from the Actions page
 ```
 
-工作流会在 Windows / macOS (arm64+x64) / Linux 上分别构建安装包，上传到 GitHub
-Releases（草稿，确认无误后手动转正式版）。
+The workflow builds installers on Windows / macOS (arm64+x64) / Linux and uploads them to GitHub
+Releases (as a draft; promote it manually after verifying).
 
-> 可选 secrets（仅启用自动更新时需要，见下文）：
-> `TAURI_SIGNING_PRIVATE_KEY`、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。
+> Optional secrets (only needed to enable auto-update, see below):
+> `TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
 
-## 🧪 CI 检查（ci.yml）
+## 🧪 CI checks (ci.yml)
 
-| Job | 内容 |
+| Job | What it does |
 | --- | --- |
-| Host boot smoke | Ubuntu 上安装 host 依赖并启动 `dsh web`，断言 URL 行 + shell HTML |
-| cargo check | Windows + Ubuntu 双平台编译检查（含 build.rs 资源校验） |
+| Host boot smoke | On Ubuntu, installs host dependencies and starts `dsh web`, asserting the URL line + shell HTML |
+| cargo check | Compile checks on Windows + Ubuntu (including build.rs resource validation) |
 
-## 🔄 自动更新（路线图）
+## 🔄 Auto-update (roadmap)
 
-当前版本未编译 `tauri-plugin-updater`。启用步骤：
+The current build does not compile in `tauri-plugin-updater`. To enable it:
 
-1. `cargo add tauri-plugin-updater` 并在 `src-tauri/src/lib.rs` 注册；
-2. 生成密钥对 `npx tauri signer generate -w ~/.tauri/dsh-desktop.key`，
-   公钥写入 `tauri.conf.json → plugins.updater.pubkey`；
-3. 在仓库 Secrets 配置 `TAURI_SIGNING_PRIVATE_KEY` 与
-   `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`；
-4. `tauri.conf.json` 配置 `plugins.updater.endpoints` 指向
-   `https://github.com/kyorakuyk/dsh-desktop/releases/latest/download/latest.json`；
-5. 推送新标签，`tauri-action` 自动上传更新清单与签名产物。
+1. `cargo add tauri-plugin-updater` and register it in `src-tauri/src/lib.rs`;
+2. Generate a keypair with `npx tauri signer generate -w ~/.tauri/dsh-desktop.key`,
+   and put the public key in `tauri.conf.json → plugins.updater.pubkey`;
+3. Configure `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` in the repo Secrets;
+4. In `tauri.conf.json`, point `plugins.updater.endpoints` at
+   `https://github.com/kyorakuyk/dsh-desktop/releases/latest/download/latest.json`;
+5. Push a new tag; `tauri-action` automatically uploads the update manifest and signed artifacts.
 
-## 🔍 故障排查
+## 🔍 Troubleshooting
 
-| 现象 | 处理 |
+| Symptom | Fix |
 | --- | --- |
-| 长时间停留在闪屏页 | 查看应用日志定位主机启动失败原因 |
-| 主机启动报错 | 日志：Windows `%LOCALAPPDATA%\com.dsh.desktop\logs\dsh-desktop.log`，macOS/Linux 见 `~/Library/Logs` 与 `~/.local/share/com.dsh.desktop/logs` |
-| 模型无响应 | 检查 设置 → 模型 中的 API Key 与模型配置 |
-| 应用内看不到终端里的 CLI（如 `bd`） | GUI 启动继承的是 launchd 的四目录桩 `PATH`；主机启动时已通过登录 shell 探测并恢复用户的 `PATH`。若个别 CLI 仍缺失，确认它位于登录 shell 的 `PATH` 中，且其 profile 脚本未阻塞超过 5 秒 |
-| 构建时提示 host bundle missing | 先执行 `npm run host:bundle`（`build.rs` 会主动报错提示） |
+| Stuck on the splash screen | Check the app logs to find why the host failed to start |
+| Host startup error | Logs: Windows `%LOCALAPPDATA%\com.dsh.desktop\logs\dsh-desktop.log`; macOS/Linux see `~/Library/Logs` and `~/.local/share/com.dsh.desktop/logs` |
+| Attach Mode: "dsh web authentication required" | The server requires its launch token. The first connect must use the **whole** URL from the `dsh web: http://…?token=…` line (the token rotates on every server restart, but is needed once — a signed cookie takes over afterwards). The **Change Server…** menu item (⌘/Ctrl+Shift+C) returns to the connect form from any page; the form never remembers a URL whose auth handshake failed |
+| Model not responding | Check the API key and model config under Settings → Model |
+| A CLI visible in the terminal (e.g. `bd`) is missing in the app | The GUI inherits launchd's four-directory stub `PATH` at startup; the host probes the login shell at startup and restores your `PATH`. If a CLI is still missing, make sure it is on the login shell's `PATH` and that its profile script doesn't block for more than 5 seconds |
+| Build says host bundle missing | Run `npm run host:bundle` first (`build.rs` reports this proactively) |
 
-## ⚠️ 已知限制
+## ⚠️ Known limitations
 
-- 首次启动需数秒（主机装配约 30 个插件行 + 前端 bundle 预取），期间显示闪屏页；
-- 安装包体积较大（内含 Node 运行时与全部 harness 依赖，约 100 MB 量级）；
-- 主机异常退出时窗口停留在最后页面（日志可见退出原因）；
-- Linux AppImage 暂不提供：CI 中 `linuxdeploy` 打包失败（deb/rpm 正常，
-  属于 AppImage 工具链问题），后续版本修复；
-- 自动更新未启用（见上文路线图）。
+- First launch takes a few seconds (the host assembles ~30 plugin lines + prefetches frontend bundles); the splash screen shows meanwhile;
+- Installer size is large (it bundles the Node runtime and all harness dependencies, on the order of ~100 MB);
+- If the host exits abnormally, the window stays on the last page (the exit reason is visible in the logs);
+- No Linux AppImage for now: `linuxdeploy` packaging fails in CI (deb/rpm work fine;
+  it's an AppImage toolchain issue), to be fixed in a later release;
+- Auto-update is not enabled (see the roadmap above).
 
 ## 📄 License
 
-[MIT](LICENSE) — 与 deepseek-harness 一致。
+[MIT](LICENSE) — same as deepseek-harness.
 
-> **免责声明**：本项目是社区桌面封装，与 DeepSeek 官方无附属关系；
-> DeepSeek Harness 及其相关商标归其各自所有者所有。
+> **Disclaimer**: this project is a community desktop wrapper, not affiliated with DeepSeek;
+> DeepSeek Harness and related trademarks belong to their respective owners.
