@@ -102,20 +102,16 @@
       const note = document.getElementById('note');
       const hint = document.getElementById('trustedHostHint');
 
-      // The hint only makes sense when the server would run without the
-      // launch-token trust of loopback: anything but localhost/127/::1.
-      function isLoopback(value) {
-        try {
-          const url = new URL(value.trim());
-          const host = url.hostname;
-          return host === 'localhost' || host === '127.0.0.1' || host === '[::1]' || host === '::1';
-        } catch {
-          return true; // not a URL yet — keep the hint out of the way
-        }
-      }
+      // The hint only makes sense for non-loopback hosts. The loopback verdict
+      // comes from Rust (`splash_is_loopback`, same rule as the probe hint) —
+      // the old JS copy diverged on IPv6 (review fix S4). Without the IPC
+      // bridge the hint simply stays hidden.
       function refreshHint() {
         const value = urlInput.value.trim();
-        hint.classList.toggle('visible', value !== '' && !isLoopback(value));
+        if (value === '') { hint.classList.remove('visible'); return; }
+        invoke('splash_is_loopback', { url: value })
+          .then((isLoopback) => { hint.classList.toggle('visible', !isLoopback); })
+          .catch(() => { hint.classList.remove('visible'); });
       }
       urlInput.addEventListener('input', () => { refreshHint(); note.textContent = ''; });
 

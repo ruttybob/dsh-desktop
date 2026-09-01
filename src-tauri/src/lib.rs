@@ -19,7 +19,12 @@ use tauri::Manager;
 /// single-instance forwarding) — wry reports no navigation failures, so the
 /// probe is the only detector for a dead server.
 fn attach_to_server(app: &tauri::AppHandle, window: &tauri::WebviewWindow, url: tauri::Url) {
-    log::info!("[launch] attach mode: navigating to {}", url.as_str());
+    // The attach URL may carry a ?token=<bearer-secret>; the in-memory URL
+    // keeps it (navigation only), every log line is redacted (host.rs).
+    log::info!(
+        "[launch] attach mode: navigating to {}",
+        host::redact_token(url.as_str())
+    );
     stub::start_monitor(app.clone(), url.clone());
     if let Err(error) = window.navigate(url) {
         log::error!("[launch] attach navigate failed: {error}");
@@ -37,10 +42,17 @@ pub fn run() {
         // instance's argv (not env — LaunchServices drops it) arrives here; an
         // --attach-url in it re-targets the running window.
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-            log::info!("[single-instance] second instance argv: {argv:?}");
+            // The second instance's argv may carry --attach-url with a token;
+            // redact each argument before the argv reaches the log.
+            let redacted_argv: Vec<String> =
+                argv.iter().map(|arg| host::redact_token(arg)).collect();
+            log::info!("[single-instance] second instance argv: {redacted_argv:?}");
             let args: Vec<String> = argv.to_vec();
             if let Some(url) = launch::resolve_relaunch_attach(&args) {
-                log::info!("[single-instance] forwarding attach to {url}",);
+                log::info!(
+                "[single-instance] forwarding attach to {}",
+                host::redact_token(url.as_str())
+            );
                 // The launch mode is fixed only at startup; forwarding may
                 // retarget an instance that launched in sidecar mode. Stop
                 // the sidecar first so the window detaches from it cleanly
@@ -70,6 +82,7 @@ pub fn run() {
         // itself — validation, remember store, and navigation are host-side.
         .invoke_handler(tauri::generate_handler![
             splash::splash_connect,
+            splash::splash_is_loopback,
             splash::splash_get_remembered,
             splash::splash_forget,
             stub::stub_retry,
@@ -104,7 +117,10 @@ pub fn run() {
                 }
                 launch::LaunchMode::Sidecar => match splash::resolve_no_signal_action() {
                     splash::NoSignalAction::Attach { url } => {
-                        log::info!("[launch] remembered server: attaching to {}", url.as_str());
+                        log::info!(
+                    "[launch] remembered server: attaching to {}",
+                    host::redact_token(url.as_str())
+                );
                         attach_to_server(app.handle(), &window, url);
                     }
                     splash::NoSignalAction::ShowForm => {

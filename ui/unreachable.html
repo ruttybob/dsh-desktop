@@ -88,37 +88,65 @@
         return tauri.core.invoke(method, args);
       }
 
-      // One line of the mono diagnostics block: "key    value".
+      // One line of the mono diagnostics block: "key    value". Built with
+      // DOM APIs + textContent only — verdict and url come from the probed
+      // server (attacker-controlled), so no dynamic value may pass through
+      // innerHTML (review fix: XSS/HTML injection).
       function row(key, value, valueClass) {
-        return '<span class="k">' + key.padEnd(9) + '</span>' +
-          (valueClass ? '<span class="' + valueClass + '">' + value + '</span>' : value);
+        const line = document.createElement('div');
+        const k = document.createElement('span');
+        k.className = 'k';
+        k.textContent = key.padEnd(9);
+        line.appendChild(k);
+        if (valueClass) {
+          const v = document.createElement('span');
+          v.className = valueClass;
+          v.textContent = value;
+          line.appendChild(v);
+        } else {
+          line.appendChild(document.createTextNode(value));
+        }
+        return line;
+      }
+
+      // Static trusted fragment (contains <kbd> markup) appended as HTML.
+      function appendStaticHint(line, text) {
+        const v = document.createElement('span');
+        v.innerHTML = text; // static string only — never dynamic values
+        line.appendChild(v);
       }
 
       function render(data) {
+        diag.replaceChildren();
         if (!data) {
-          diag.innerHTML = row('status', 'no monitored server', 'bad');
+          diag.replaceChildren(row('status', 'no monitored server', 'bad'));
           return;
         }
         const verdictClass = data.verdict.startsWith('alive') ? 'ok' : 'bad';
         const retry = data.attempt > 0
           ? 'attempt ' + data.attempt + ', next probe in ' + Math.round(data.next_retry_ms / 1000) + 's'
           : 'attempt 0';
-        const hint = data.non_loopback
-          ? 'non-loopback host — server needs <kbd>--trusted-host</kbd>'
-          : 'loopback host — no --trusted-host required';
-        diag.innerHTML = [
-          row('url', data.url),
-          row('probe', data.verdict, verdictClass),
-          row('retry', retry),
-          row('hint', hint),
-        ].join('<br>');
+        diag.appendChild(row('url', data.url));
+        diag.appendChild(row('probe', data.verdict, verdictClass));
+        diag.appendChild(row('retry', retry));
+        const hintLine = row('hint', '');
+        const hint = hintLine.lastChild;
+        if (data.non_loopback) {
+          hint.append('non-loopback host — server needs ');
+          const kbd = document.createElement('kbd');
+          kbd.textContent = '--trusted-host';
+          hint.append(kbd);
+        } else {
+          hint.textContent = 'loopback host — no --trusted-host required';
+        }
+        diag.appendChild(hintLine);
       }
 
       async function refresh() {
         try {
           render(await invoke('stub_diagnostics'));
         } catch (error) {
-          diag.innerHTML = row('status', String(error), 'bad');
+          diag.replaceChildren(row('status', String(error), 'bad'));
         }
       }
 

@@ -377,7 +377,9 @@ fn parse_url_line(line: &str) -> Option<String> {
 /// whitespace, or end of string) with `token=[redacted]`. Applied to host
 /// stdout before it reaches the log: the launch token is a bearer secret and
 /// the unredacted URL must live only in memory, used solely for navigation.
-fn redact_token(line: &str) -> String {
+/// `pub(crate)`: every module that logs an attach-related URL or argv
+/// (splash, stub, lib single-instance forwarding) applies the same redaction.
+pub(crate) fn redact_token(line: &str) -> String {
     const MARKER: &str = "token=";
     let mut result = String::with_capacity(line.len());
     let mut rest = line;

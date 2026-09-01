@@ -94,7 +94,34 @@ fn save_remembered_at(path: &std::path::Path, url: &str) -> Result<(), String> {
             .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
     }
     let raw = serde_json::to_string_pretty(&entry).map_err(|error| error.to_string())?;
-    std::fs::write(path, raw).map_err(|error| format!("cannot write {}: {error}", path.display()))
+    // Atomic write with owner-only perms: the stored URL may carry a
+    // ?token=<bearer-secret>, and a torn write must never leave a half file.
+    let dir = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent", path.display()))?;
+    let tmp = dir.join(format!(
+        ".{}.tmp-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("attach-server.json"),
+        std::process::id()
+    ));
+    let write = |file: &std::path::Path| -> Result<(), String> {
+        std::fs::write(file, &raw).map_err(|error| format!("cannot write {}: {error}", file.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| format!("cannot chmod {}: {error}", file.display()))?;
+        }
+        Ok(())
+    };
+    write(&tmp)?;
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("cannot finalize {}: {error}", path.display()));
+    }
+    Ok(())
 }
 
 /// Remove the remembered entry. A missing file is already "cleared".
@@ -143,6 +170,8 @@ pub enum NoSignalAction {
 /// `read_remembered_url`); a value that somehow fails validation degrades to
 /// the form rather than navigating anywhere.
 pub fn decide_no_signal_launch(remembered: Option<&str>) -> NoSignalAction {
+    // Re-validation here is deliberate defense in depth: read_remembered_url
+    // already validated, but the store may change between read and decision.
     match remembered.map(validate_attach_url) {
         Some(Ok(url)) => NoSignalAction::Attach { url },
         Some(Err(error)) => {
@@ -169,6 +198,17 @@ pub(crate) fn is_loopback_url(url: &Url) -> bool {
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
         Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
         None => false,
+    }
+}
+
+/// IPC: the Rust-side loopback verdict for a URL (same rule as the probe's
+/// diagnostics hint). The splash page consumes this instead of keeping its own
+/// JS copy, which had already diverged on IPv6 (dsh-df4 review S4).
+#[tauri::command]
+pub fn splash_is_loopback(url: String) -> bool {
+    match crate::launch::parse_attach_url(url.trim()) {
+        Ok(url) if url.host_str().is_some() => is_loopback_url(&url),
+        _ => false,
     }
 }
 
@@ -208,15 +248,18 @@ pub fn splash_connect(
     };
     if remember {
         save_remembered_at(&path, url.as_str())?;
-        log::info!("[splash] remembered server {}", url.as_str());
+        log::info!("[splash] remembered server {}", crate::host::redact_token(url.as_str()));
     } else {
         clear_remembered_at(&path)?;
-        log::info!("[splash] remember cleared on connect to {}", url.as_str());
+        log::info!(
+            "[splash] remember cleared on connect to {}",
+            crate::host::redact_token(url.as_str())
+        );
     }
     let non_loopback = !is_loopback_url(&url);
     log::info!(
         "[splash] navigating to {}{}",
-        url.as_str(),
+        crate::host::redact_token(url.as_str()),
         if non_loopback {
             " (non-loopback: server must run with --trusted-host)"
         } else {
@@ -312,6 +355,14 @@ mod tests {
         let entry: RememberedServer = serde_json::from_str(&raw).unwrap();
         assert_eq!(entry.version, STORE_VERSION);
         assert_eq!(entry.url, "http://127.0.0.1:3080/");
+
+        // The stored URL may carry a token: the file must be owner-only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "remember store must be 0o600");
+        }
 
         assert!(clear_remembered_at(&path).is_ok());
         assert!(!path.exists());
