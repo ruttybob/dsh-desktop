@@ -189,7 +189,7 @@ fn surface_version(window: &WebviewWindow, version: Option<String>) {
         thread::sleep(std::time::Duration::from_millis(600));
         let script = format!(
             "const s = document.getElementById('status'); \
-             if (s) {{ s.textContent = '正在启动主机服务 v{safe}…'; }}"
+             if (s) {{ s.textContent = 'Starting the sidecar host v{safe}…'; }}"
         );
         if let Err(error) = window.eval(&script) {
             log::warn!("[host] version line on the loading screen failed: {error}");
