@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -20,7 +20,7 @@
       body {
         background: #0d1117;
         color: #e6edf3;
-        font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+        font-family: "Segoe UI", system-ui, sans-serif;
         display: flex;
         flex-direction: column;
         align-items: center;
@@ -109,11 +109,12 @@
     <h1>DeepSeek Harness Desktop</h1>
     <div class="status">
       <div class="spinner"></div>
-      <span id="status">正在启动主机服务…</span>
+      <span id="status">Starting the sidecar host…</span>
     </div>
     <div class="hint">
-      首次启动需要数秒装配 DeepSeek Harness 插件树（约 30 个插件行 + 前端模块预取）。
-      若长时间停留在此页，请查看应用日志。
+      First launch takes a few seconds to assemble the DeepSeek Harness plugin
+      tree (~30 plugin rows + frontend module prefetch). If this screen stays
+      up for long, check the app logs.
     </div>
   </body>
 </html>
