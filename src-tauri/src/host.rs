@@ -7,12 +7,15 @@
 //! loader tree settles, and navigate the WebView there. Logs from both streams
 //! are forwarded through the `log` facade (tauri-plugin-log).
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::thread;
+use std::time::Duration;
 
+use tauri::webview::Cookie;
 use tauri::{AppHandle, Manager, Url, WebviewWindow};
 
 /// Owns the host child process; `stop()` is called on app exit.
@@ -124,6 +127,7 @@ impl HostManager {
                     match Url::parse(&url) {
                         Ok(url) => {
                             log::info!("[host] navigating to {}", redact_token(url.as_str()));
+                            inject_browser_session_cookie(&url, &window);
                             if let Err(error) = window.navigate(url) {
                                 log::error!("[host] navigate failed: {error}");
                             }
@@ -153,6 +157,113 @@ impl HostManager {
             log::info!("[host] sidecar stopped");
         }
     }
+}
+
+/// Mint the browser-session cookie out-of-band and inject it into the
+/// WebView's cookie store before the ready-line navigation lands.
+///
+/// Why: the harness mints the cookie on a 303 response to the tokenized root
+/// request, and WKWebView has been observed to lose a `Set-Cookie` that
+/// arrives on an instant local redirect — the window then strands on the
+/// harness `401` page ("dsh web authentication required"). The smoke test's
+/// token→cookie dance over plain HTTP is immune to that, so the shell runs
+/// the same dance here (GET the tokenized URL, never following redirects),
+/// captures the `Set-Cookie` pair, and places it into the WebView cookie
+/// store directly. The tokenized navigation still runs afterwards: the server
+/// simply re-mints, and if injection failed the old browser-side path
+/// remains as the fallback.
+///
+/// The captured value is a bearer-equivalent session secret and is never
+/// logged. A session-scoped cookie is injected deliberately: the sidecar's
+/// port is OS-assigned, so no cookie may outlive this launch (spec dsh-u3m.7,
+/// US#10).
+fn inject_browser_session_cookie(url: &Url, window: &WebviewWindow) {
+    let (name, value) = match mint_browser_session_cookie(url) {
+        Ok(pair) => pair,
+        Err(error) => {
+            log::warn!("[host] browser-session cookie not minted: {error}");
+            return;
+        }
+    };
+    let Some(domain) = url.host_str() else {
+        return;
+    };
+    let cookie = Cookie::build((name, value))
+        .domain(domain.to_string())
+        .path("/")
+        .build();
+    if let Err(error) = window.set_cookie(cookie) {
+        log::warn!("[host] cookie injection failed: {error}");
+    }
+}
+
+/// Run the token→cookie dance over a plain HTTP GET of `url` without
+/// following redirects: connect to the sidecar, read the 303's `Set-Cookie`,
+/// and return the `(name, value)` pair (value cut at the first attribute
+/// delimiter, mirroring what the browser stores).
+fn mint_browser_session_cookie(url: &Url) -> Result<(String, String), String> {
+    let host = url.host_str().unwrap_or_default().to_string();
+    if host.is_empty() {
+        return Err("ready URL carries no host".to_string());
+    }
+    let port = url.port_or_known_default().unwrap_or(80);
+    // The Host header IS the authority the server signs the cookie for, and
+    // the browser sends it host:port for this non-default port — mirror it
+    // exactly so the injected cookie matches the WebView's later requests.
+    let authority = format!("{host}:{port}");
+    let path = url.path();
+    let path_with_query = match url.query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path.to_string(),
+    };
+    let request = format!(
+        "GET {path_with_query} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+    );
+
+    let mut stream = TcpStream::connect((host.as_str(), port))
+        .map_err(|error| format!("connect failed: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|error| format!("read timeout setup failed: {error}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .map_err(|error| format!("write timeout setup failed: {error}"))?;
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| format!("request write failed: {error}"))?;
+
+    let mut raw = Vec::new();
+    stream
+        .take(64 * 1024)
+        .read_to_end(&mut raw)
+        .map_err(|error| format!("response read failed: {error}"))?;
+    let response = String::from_utf8_lossy(&raw);
+    let (status_line, headers) = response.split_once("\r\n").ok_or("malformed response")?;
+    if !status_line.contains(" 303") {
+        return Err(format!("expected a 303, got {:.32}", status_line));
+    }
+    extract_set_cookie_pair(headers)
+        .ok_or_else(|| "the 303 carried no Set-Cookie".to_string())
+}
+
+/// Pull the first `Set-Cookie` header out of a raw header block and cut its
+/// `name=value` pair off before the first attribute delimiter. Case-
+/// insensitive on the header name; the value is returned raw (it is
+/// base64url-plus-signature and cookie-safe).
+fn extract_set_cookie_pair(headers: &str) -> Option<(String, String)> {
+    for line in headers.split("\r\n") {
+        let Some((field, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !field.trim().eq_ignore_ascii_case("set-cookie") {
+            continue;
+        }
+        let pair = value.trim();
+        let (name, cookie_value) = pair.split_once('=')?;
+        let cookie_value = cookie_value.split(';').next().unwrap_or_default().trim();
+        return Some((name.trim().to_string(), cookie_value.to_string()));
+    }
+    None
 }
 
 /// The bundled harness release version: the top-level `version` field of
@@ -650,6 +761,101 @@ mod tests {
             let scratch = Scratch::new("empty");
             write_manifest(&scratch.0, r#"{"name":"@deepseek-ai/dsh","version":""}"#);
             assert_eq!(bundled_host_version(&scratch.0), None);
+        }
+    }
+
+    mod browser_session_cookie {
+        use super::super::{extract_set_cookie_pair, mint_browser_session_cookie};
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use tauri::Url;
+
+        const CANNED_303: &str = "HTTP/1.1 303 See Other\r\n\
+             cache-control: no-store\r\n\
+             location: /\r\n\
+             set-cookie: dsh-auth-AbCd=v1.cGF5bG9hZA.wijd; Max-Age=86400; Path=/; HttpOnly; SameSite=Strict\r\n\
+             \r\n";
+
+        #[test]
+        fn extracts_the_name_value_pair_cut_before_attributes() {
+            let headers = "cache-control: no-store\r\n\
+                 set-cookie: dsh-auth-AbCd=v1.cGF5bG9hZA.wijd; Max-Age=86400; Path=/; HttpOnly\r\n";
+            assert_eq!(
+                extract_set_cookie_pair(headers),
+                Some(("dsh-auth-AbCd".to_string(), "v1.cGF5bG9hZA.wijd".to_string()))
+            );
+        }
+
+        #[test]
+        fn matches_the_header_name_case_insensitively() {
+            let headers = "SET-COOKIE: dsh-auth-x=v1.a.sig\r\n";
+            assert_eq!(
+                extract_set_cookie_pair(headers),
+                Some(("dsh-auth-x".to_string(), "v1.a.sig".to_string()))
+            );
+        }
+
+        #[test]
+        fn returns_none_without_a_set_cookie_header() {
+            assert_eq!(extract_set_cookie_pair("location: /\r\n\r\n"), None);
+        }
+
+        /// A one-shot local server answering the canned 303, so the mint runs
+        /// its real socket path against a loopback peer.
+        #[test]
+        fn mints_from_a_canned_303_over_a_real_socket() {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            let port = listener.local_addr().expect("local addr").port();
+            std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().expect("accept");
+                // A real server answers once the request head is complete; it
+                // never waits for the client's EOF (the connection stays
+                // half-open while the response travels).
+                let mut request = Vec::new();
+                let mut buf = [0u8; 512];
+                loop {
+                    let read = socket.read(&mut buf).expect("read the probe request");
+                    request.extend_from_slice(&buf[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") || read == 0 {
+                        break;
+                    }
+                }
+                assert!(
+                    request.starts_with(b"GET /?token=abc HTTP/1.1\r\n"),
+                    "{:?}",
+                    String::from_utf8_lossy(&request)
+                );
+                assert!(
+                    request.windows(17).any(|window| window == b"Connection: close"),
+                    "{:?}",
+                    String::from_utf8_lossy(&request)
+                );
+                socket.write_all(CANNED_303.as_bytes()).expect("write 303");
+                socket
+                    .shutdown(std::net::Shutdown::Write)
+                    .expect("close for EOF");
+            });
+            let url = Url::parse(&format!("http://127.0.0.1:{port}/?token=abc")).expect("url");
+            assert_eq!(
+                mint_browser_session_cookie(&url),
+                Ok(("dsh-auth-AbCd".to_string(), "v1.cGF5bG9hZA.wijd".to_string()))
+            );
+        }
+
+        #[test]
+        fn refuses_a_non_303_answer() {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            let port = listener.local_addr().expect("local addr").port();
+            std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().expect("accept");
+                let mut request = String::new();
+                let _ = socket.read_to_string(&mut request);
+                socket
+                    .write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n")
+                    .expect("write 401");
+            });
+            let url = Url::parse(&format!("http://127.0.0.1:{port}/?token=abc")).expect("url");
+            assert!(mint_browser_session_cookie(&url).is_err());
         }
     }
 
