@@ -22,10 +22,18 @@ pub fn run() {
         // URL guard keeps the patch off the harness page the ready line
         // navigates to later.
         .on_page_load(|webview, payload| {
-            if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished)
-                && payload.url().as_str().contains("index.html")
-            {
-                host::surface_version(webview);
+            if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+                let url = payload.url().as_str();
+                if url.contains("index.html") {
+                    host::surface_version(webview);
+                } else if url.starts_with("http://127.0.0.1") {
+                    // The transition's completion signal: a page from the
+                    // sidecar's origin finished loading in the WebView. The
+                    // launch e2e waits for this line — without it a window
+                    // stranded on the loading screen passes every other
+                    // marker.
+                    log::info!("[launch] harness page loaded ({url})");
+                }
             }
         })
         .setup(|app| {

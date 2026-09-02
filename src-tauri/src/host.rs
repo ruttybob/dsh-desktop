@@ -941,9 +941,11 @@ mod tests {
     }
 
     /// The real sidecar's output pushed through the real redaction boundary
-    /// (`redact_token` — the one function every logged line crosses): no raw
-    /// launch token may survive. This is the persisted-log guarantee (spec
-    /// dsh-u3m.7 US#17), exercised against the exact entry the app ships.
+    /// (`redact_token` — the boundary function the shell applies to every
+    /// logged line; that the application happens is proven end-to-end by the
+    /// launch e2e's persisted-log scan): no raw launch token may survive.
+    /// This is the persisted-log guarantee (spec dsh-u3m.7 US#17) exercised
+    /// against the exact entry the app ships.
     #[cfg(unix)]
     mod sidecar_redaction_boundary {
         use super::super::{parse_url_line, redact_token};
@@ -958,18 +960,16 @@ mod tests {
         /// Locate a runnable sidecar: the assembled bundle first (its node
         /// runtime included), then the checkout's `host/` directory on the
         /// PATH `node`. `None` skips the test where neither is prepared (a
-        /// bare checkout without `npm run host:install`).
+        /// bare checkout without `npm -C host install --prod`).
         fn resolve_sidecar() -> Option<(String, PathBuf)> {
             let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
             let bundled = manifest.join("resources").join("host");
-            if bundled.join("main.mjs").exists() && bundled.join("node_modules").exists() {
-                let node = bundled
-                    .join("node")
-                    .join("bin")
-                    .join("node")
-                    .to_string_lossy()
-                    .into_owned();
-                return Some((node, bundled.join("main.mjs")));
+            let node = bundled.join("node").join("bin").join("node");
+            if bundled.join("main.mjs").exists()
+                && bundled.join("node_modules").exists()
+                && node.exists()
+            {
+                return Some((node.to_string_lossy().into_owned(), bundled.join("main.mjs")));
             }
             let checkout = manifest.parent()?.join("host");
             if checkout.join("main.mjs").exists() && checkout.join("node_modules").exists() {
@@ -979,6 +979,12 @@ mod tests {
         }
 
         fn scratch_home(tag: &str) -> PathBuf {
+            scratch_home_guard(tag).0
+        }
+
+        /// The scratch home plus its self-cleaning guard: the directory is
+        /// removed whenever the guard drops, panic or not.
+        fn scratch_home_guard(tag: &str) -> (PathBuf, ScratchGuard) {
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|elapsed| elapsed.as_nanos())
@@ -988,7 +994,15 @@ mod tests {
                 std::process::id(),
             ));
             std::fs::create_dir_all(&dir).expect("create scratch home");
-            dir
+            (dir.clone(), ScratchGuard(dir))
+        }
+
+        struct ScratchGuard(PathBuf);
+
+        impl Drop for ScratchGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
         }
 
         #[test]
@@ -999,7 +1013,7 @@ mod tests {
                 );
                 return;
             };
-            let home = scratch_home("boundary");
+            let (home, _home_guard) = scratch_home_guard("boundary");
             let mut child = Command::new(&node_bin)
                 .arg(&entry)
                 .env("DSH_DESKTOP_PORT", "0")

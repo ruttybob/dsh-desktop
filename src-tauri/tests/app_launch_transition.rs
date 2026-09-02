@@ -25,17 +25,19 @@
 
 #![cfg(target_os = "macos")]
 
-use std::io::{Read, Seek};
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const LOG_RELATIVE: &str = "Library/Logs/com.dsh.desktop/dsh-desktop.log";
 const APP_NAME: &str = "dsh-desktop";
-const MARKERS: [&str; 2] = [
+const MARKERS: [&str; 3] = [
     "auth path verified through proxy (200)",
     "navigating via cookie proxy on",
+    "harness page loaded (",
 ];
+const FAILURE_MARKERS: [&str; 2] = ["navigate failed", "proxied navigation failed"];
 
 fn workspace() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().expect("repo root").to_path_buf()
@@ -61,7 +63,6 @@ fn read_log() -> String {
     let Ok(mut file) = std::fs::File::open(&path) else {
         return String::new();
     };
-    let _ = file.seek(std::io::SeekFrom::Start(0));
     let mut raw = Vec::new();
     let _ = file.read_to_end(&mut raw);
     String::from_utf8_lossy(&raw).into_owned()
@@ -118,7 +119,7 @@ fn assert_no_raw_token_in(log: &str) {
 fn app_process_count() -> u32 {
     Command::new("pgrep")
         .arg("-f")
-        .arg(format!("{APP_NAME}.app"))
+        .arg(format!("{APP_NAME}.app/Contents/MacOS"))
         .output()
         .map(|output| {
             String::from_utf8_lossy(&output.stdout)
@@ -127,6 +128,45 @@ fn app_process_count() -> u32 {
                 .count() as u32
         })
         .unwrap_or(0)
+}
+
+/// Quit-and-kill guard: whatever happens in the test (panic included), no
+/// dsh-desktop instance or sidecar is left behind to trip the next run's
+/// precondition.
+struct AppGuard;
+
+impl AppGuard {
+    fn arm() -> Self {
+        AppGuard
+    }
+}
+
+impl Drop for AppGuard {
+    fn drop(&mut self) {
+        if app_process_count() == 0 {
+            return;
+        }
+        let _ = Command::new("osascript")
+            .arg("-e")
+            .arg(format!("quit app \"{APP_NAME}\""))
+            .status();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app_process_count() > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        if app_process_count() > 0 {
+            let _ = Command::new("pkill")
+                .arg("-9")
+                .arg("-f")
+                .arg(format!("{APP_NAME}.app/Contents/MacOS"))
+                .status();
+        }
+        let _ = Command::new("pkill")
+            .arg("-9")
+            .arg("-f")
+            .arg("resources/host/main.mjs")
+            .status();
+    }
 }
 
 #[test]
@@ -143,8 +183,21 @@ fn launch_reaches_the_authenticated_gui_and_the_log_stays_token_free() {
         0,
         "a dsh-desktop instance is already running; quit it before this test"
     );
+    // Whatever happens from here (panic included), nothing is left behind.
+    let _guard = AppGuard;
 
-    let baseline = read_log();
+    // Archive the previous log so this launch's markers cannot be satisfied
+    // by a previous session's lines (the rotation fallback in new_log_since
+    // would otherwise make the wait vacuous). The archive keeps the history.
+    if app_log().exists() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis())
+            .unwrap_or_default();
+        let archived = app_log().with_extension(format!("log.{stamp}.bak"));
+        std::fs::rename(&app_log(), archived).expect("archive the previous log");
+    }
+    let baseline = String::new();
     let opened = Command::new("open")
         .arg("-n")
         .arg(&app)
@@ -163,6 +216,21 @@ fn launch_reaches_the_authenticated_gui_and_the_log_stays_token_free() {
     assert!(
         new_log.contains("bundled harness version:"),
         "the bundled version line must be logged"
+    );
+    // Navigation actually completed — the shell logs its failures, and a
+    // stranded loading screen would never produce the harness page-load
+    // marker at all.
+    for failure in FAILURE_MARKERS {
+        assert!(
+            !new_log.contains(failure),
+            "navigation failure logged: {failure}"
+        );
+    }
+    // Non-vacuous token scan: the ready line guarantees a redacted token is
+    // in the log; its absence would mean nothing was scanned.
+    assert!(
+        new_log.contains("token=[redacted]"),
+        "vacuous scan: no ready line in the log region"
     );
     assert_no_raw_token_in(&read_log());
 
