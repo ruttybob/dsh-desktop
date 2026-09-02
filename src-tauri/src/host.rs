@@ -940,6 +940,159 @@ mod tests {
         }
     }
 
+    /// The real sidecar's output pushed through the real redaction boundary
+    /// (`redact_token` — the one function every logged line crosses): no raw
+    /// launch token may survive. This is the persisted-log guarantee (spec
+    /// dsh-u3m.7 US#17), exercised against the exact entry the app ships.
+    #[cfg(unix)]
+    mod sidecar_redaction_boundary {
+        use super::super::{parse_url_line, redact_token};
+        use std::io::{BufRead, BufReader};
+        use std::path::PathBuf;
+        use std::process::{Command, Stdio};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        /// Locate a runnable sidecar: the assembled bundle first (its node
+        /// runtime included), then the checkout's `host/` directory on the
+        /// PATH `node`. `None` skips the test where neither is prepared (a
+        /// bare checkout without `npm run host:install`).
+        fn resolve_sidecar() -> Option<(String, PathBuf)> {
+            let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let bundled = manifest.join("resources").join("host");
+            if bundled.join("main.mjs").exists() && bundled.join("node_modules").exists() {
+                let node = bundled
+                    .join("node")
+                    .join("bin")
+                    .join("node")
+                    .to_string_lossy()
+                    .into_owned();
+                return Some((node, bundled.join("main.mjs")));
+            }
+            let checkout = manifest.parent()?.join("host");
+            if checkout.join("main.mjs").exists() && checkout.join("node_modules").exists() {
+                return Some(("node".to_string(), checkout.join("main.mjs")));
+            }
+            None
+        }
+
+        fn scratch_home(tag: &str) -> PathBuf {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default();
+            let dir = std::env::temp_dir().join(format!(
+                "dsh-desktop-redaction-{tag}-{}-{nanos}",
+                std::process::id(),
+            ));
+            std::fs::create_dir_all(&dir).expect("create scratch home");
+            dir
+        }
+
+        #[test]
+        fn no_raw_launch_token_survives_the_logging_boundary() {
+            let Some((node_bin, entry)) = resolve_sidecar() else {
+                eprintln!(
+                    "skipping: no runnable sidecar (run `npm run host:bundle` or `npm -C host install --prod`)"
+                );
+                return;
+            };
+            let home = scratch_home("boundary");
+            let mut child = Command::new(&node_bin)
+                .arg(&entry)
+                .env("DSH_DESKTOP_PORT", "0")
+                .env("DSH_HOME", &home)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn the sidecar");
+            let stdout = child.stdout.take().expect("piped stdout");
+            let stderr = child.stderr.take().expect("piped stderr");
+
+            // Both streams are collected exactly as the shell forwards them:
+            // line by line, through the redaction boundary.
+            let collect = |pipe: Box<dyn BufRead + Send>| -> (Arc<Mutex<Vec<String>>>, Arc<AtomicBool>) {
+                let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+                let done = Arc::new(AtomicBool::new(false));
+                let lines_w = Arc::clone(&lines);
+                let done_w = Arc::clone(&done);
+                thread::spawn(move || {
+                    for line in pipe.lines().map_while(Result::ok) {
+                        lines_w.lock().expect("line lock").push(line);
+                    }
+                    done_w.store(true, Ordering::SeqCst);
+                });
+                (lines, done)
+            };
+            let (out_lines, out_done) = collect(Box::new(BufReader::new(stdout)));
+            let (err_lines, _err_done) = collect(Box::new(BufReader::new(stderr)));
+
+            // Wait for the ready line, then a short drain so trailing boot
+            // output (the lines most likely to quote the URL) is collected.
+            let deadline = Instant::now() + Duration::from_secs(90);
+            let ready_url = loop {
+                let found = out_lines
+                    .lock()
+                    .expect("line lock")
+                    .iter()
+                    .find_map(|line| parse_url_line(line));
+                if let Some(url) = found {
+                    break url;
+                }
+                if out_done.load(Ordering::SeqCst) || Instant::now() > deadline {
+                    child.kill().ok();
+                    panic!("sidecar printed no ready line within the budget");
+                }
+                thread::sleep(Duration::from_millis(200));
+            };
+            thread::sleep(Duration::from_millis(1500));
+            child.kill().ok();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(&home);
+
+            // The raw token, straight from the ready line: this exact byte
+            // sequence must not appear in any redacted line.
+            let raw_token = ready_url
+                .split("token=")
+                .nth(1)
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                raw_token.len() >= 20,
+                "ready URL carries no plausible token: {ready_url}"
+            );
+            let redacted_ready = redact_token(&format!("dsh web: {ready_url}"));
+            assert!(
+                redacted_ready.contains("token=[redacted]"),
+                "the ready line must redact: {redacted_ready}"
+            );
+
+            let all = out_lines
+                .lock()
+                .expect("line lock")
+                .iter()
+                .chain(err_lines.lock().expect("line lock").iter())
+                .map(|line| redact_token(line))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !all.contains(&raw_token),
+                "a raw launch token survived the redaction boundary"
+            );
+            let raw_stream = format!(
+                "{}\n{}",
+                out_lines.lock().expect("line lock").join("\n"),
+                err_lines.lock().expect("line lock").join("\n")
+            );
+            assert!(
+                raw_stream.contains(&raw_token),
+                "vacuous test: the sidecar never printed the raw token"
+            );
+        }
+    }
+
     #[test]
     fn redacts_the_token_value() {
         assert_eq!(
