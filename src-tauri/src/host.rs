@@ -40,13 +40,17 @@ impl HostManager {
                 child: Mutex::new(None),
             };
         };
-        // A GUI launch sees launchd's stub PATH; restore the login shell's
-        // PATH first so both the bare-node fallback and the spawned host see
-        // the user's own CLI locations (Homebrew, nvm, ~/.local/bin).
-        let restored_path = restore_login_shell_path();
+        // A GUI launch inherits launchd's stub environment; restore the login
+        // shell's full exported environment so the sidecar sees the same
+        // DSH_HOME, proxy, and provider variables a terminal `dsh web` gets.
+        let login_env = restore_login_shell_env();
+        let login_path = login_env
+            .as_ref()
+            .and_then(|vars| lookup_var(vars, "PATH"))
+            .map(|value| value.to_string());
         let node = strip_verbatim_prefix(match host_node_binary(host_dir) {
             Some(bundled) => bundled,
-            None => fallback_node_binary(restored_path.as_deref()),
+            None => fallback_node_binary(login_path.as_deref()),
         });
         let entry = strip_verbatim_prefix(host_dir.join("main.mjs"));
         let workspace = ensure_workspace_dir();
@@ -60,13 +64,15 @@ impl HostManager {
         let mut cmd = Command::new(&node);
         cmd.arg(entry)
             .current_dir(&workspace)
-            .env("DSH_DESKTOP_PORT", "0")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if let Some(path) = restored_path {
-            cmd.env("PATH", path);
-        }
+        // Environment layering (see `sidecar_env`): ambient base, then the
+        // login-shell exports — they win over launchd's stubs, then nothing
+        // else. The app's mandated variables are part of `sidecar_env` and
+        // therefore land above every login export; a profile can never
+        // intercept the sidecar contract.
+        cmd.envs(sidecar_env(std::env::vars_os(), login_env.as_deref().unwrap_or(&[])));
         // No console window on Windows (WebView2 app shell).
         #[cfg(windows)]
         {
@@ -393,61 +399,69 @@ fn host_node_binary(host_dir: &Path) -> Option<PathBuf> {
 
 // ── login-shell environment restoration ─────────────────────────────────────
 //
-// A macOS GUI launch inherits launchd's four-directory stub PATH
-// (/usr/bin:/bin:/usr/sbin:/sbin): Homebrew, nvm, and home-local binaries —
-// `bd` among them — stay invisible to the host process and every session
-// shell beneath it. Before spawning the sidecar we ask the user's login
-// shell to evaluate its profile scripts and print its PATH (the VS Code
-// approach); on any failure the ambient environment is kept, so the app
-// never boots slower than the probe budget below.
+// A macOS GUI launch inherits launchd's stub environment
+// (/usr/bin:/bin:/usr/sbin:/sbin for PATH, nothing user-configured besides):
+// Homebrew, nvm, and home-local binaries — `bd` among them — stay invisible
+// to the host process, and a DSH_HOME or proxy variable exported in the
+// user's profile never reaches the sidecar, quietly splitting the desktop
+// and terminal deployments into two data homes. Before spawning the sidecar
+// we ask the user's login shell to evaluate its profile scripts and print
+// its whole exported environment (the VS Code approach, generalized from
+// PATH to every variable); on any failure the ambient environment is kept,
+// so the app never boots slower than the probe budget below.
 
-/// How long the login-shell PATH probe may run before the ambient PATH wins:
-/// a wedged profile script must not stall app boot.
+/// How long the login-shell environment probe may run before the ambient
+/// environment wins: a wedged profile script must not stall app boot.
 #[cfg(unix)]
-const SHELL_PATH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const SHELL_ENV_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Upper bound of accepted probe output. Real PATH values sit far below this;
-/// more means a misbehaving profile, not a longer PATH.
+/// Upper bound of accepted probe output. Real environments sit far below
+/// this; more means a misbehaving profile, not a bigger environment.
 #[cfg(unix)]
-const SHELL_PATH_MAX_OUTPUT_BYTES: u64 = 64 * 1024;
+const SHELL_ENV_MAX_OUTPUT_BYTES: u64 = 64 * 1024;
 
-/// Marker wrapping the probe payload so profile startup noise cannot corrupt
-/// the parsed value.
+/// Marker printed before the probe payload so profile startup noise cannot
+/// corrupt the parse; a repeated marker means the last payload wins.
 #[cfg(unix)]
-const SHELL_PATH_MARKER: &str = "__DSH_PATH__";
+const SHELL_ENV_MARKER: &str = "__DSH_ENV__";
 
-/// Restore the user's login-shell `PATH` by running `<SHELL> -ilc 'printf …'`.
+/// Restore the user's login-shell exported environment by running
+/// `<SHELL> -ilc 'printf <marker>; env -0'`.
 ///
-/// Returns `None` when `SHELL` is unset, the shell cannot be spawned, or the
-/// probe times out, fails, or yields nothing usable — every failure keeps the
-/// inherited environment rather than blocking launch.
+/// Returns the `KEY=VALUE` pairs printed after the last marker, or `None`
+/// when `SHELL` is unset, the shell cannot be spawned, or the probe times
+/// out, fails, or yields nothing usable — every failure keeps the inherited
+/// environment rather than blocking launch. Values never reach the log:
+/// callers may log the variable count and names only.
 #[cfg(unix)]
-fn restore_login_shell_path() -> Option<String> {
+fn restore_login_shell_env() -> Option<Vec<(String, String)>> {
     let shell = PathBuf::from(std::env::var_os("SHELL")?);
     use std::time::{Duration, Instant};
     let mut child = Command::new(&shell)
-        .args(["-ilc", &format!("printf '{SHELL_PATH_MARKER}%s' \"$PATH\"")])
+        .args(["-ilc", &format!("printf '{SHELL_ENV_MARKER}'; env -0")])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .stdout(Stdio::piped())
         .spawn()
-        .inspect_err(|error| log::warn!("[host] PATH probe via {shell:?} failed to start: {error}"))
+        .inspect_err(|error| {
+            log::warn!("[host] environment probe via {shell:?} failed to start: {error}")
+        })
         .ok()?;
-    let deadline = Instant::now() + SHELL_PATH_PROBE_TIMEOUT;
+    let deadline = Instant::now() + SHELL_ENV_PROBE_TIMEOUT;
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) if Instant::now() >= deadline => {
                 log::warn!(
-                    "[host] PATH probe via {shell:?} exceeded {} ms; keeping ambient PATH",
-                    SHELL_PATH_PROBE_TIMEOUT.as_millis(),
+                    "[host] environment probe via {shell:?} exceeded {} ms; keeping ambient environment",
+                    SHELL_ENV_PROBE_TIMEOUT.as_millis(),
                 );
                 reap_probe_child(&mut child);
                 return None;
             }
             Ok(None) => thread::sleep(Duration::from_millis(25)),
             Err(error) => {
-                log::warn!("[host] PATH probe wait failed: {error}; keeping ambient PATH");
+                log::warn!("[host] environment probe wait failed: {error}; keeping ambient environment");
                 reap_probe_child(&mut child);
                 return None;
             }
@@ -455,26 +469,30 @@ fn restore_login_shell_path() -> Option<String> {
     }
     // Drain only after the shell has exited. A profile that prints more than
     // one pipe capacity before exiting blocks on write instead of exiting,
-    // trips the deadline above, and is killed — losing its PATH, which is the
-    // accepted degradation: real payloads sit far below one pipe buffer.
+    // trips the deadline above, and is killed — losing its environment, which
+    // is the accepted degradation: real payloads sit far below one pipe
+    // buffer.
     use std::io::Read as _;
     let mut captured = Vec::new();
     if let Some(stdout) = child.stdout.take() {
         let _ = stdout
-            .take(SHELL_PATH_MAX_OUTPUT_BYTES)
+            .take(SHELL_ENV_MAX_OUTPUT_BYTES)
             .read_to_end(&mut captured);
     }
-    let path = extract_probe_path(&String::from_utf8_lossy(&captured))?;
-    log::info!(
-        "[host] restored login-shell PATH ({} entries)",
-        path.split(':').count()
+    let vars = extract_probe_env(&String::from_utf8_lossy(&captured))?;
+    log::info!("[host] restored login-shell environment ({} vars)", vars.len());
+    // Names only, never values — and only at debug, so the default launch
+    // log carries the count alone.
+    log::debug!(
+        "[host] login-shell environment names: {}",
+        vars.iter().map(|(key, _)| key.as_str()).collect::<Vec<_>>().join(" ")
     );
-    Some(path)
+    Some(vars)
 }
 
 /// Non-Unix platforms keep the inherited environment.
 #[cfg(not(unix))]
-fn restore_login_shell_path() -> Option<String> {
+fn restore_login_shell_env() -> Option<Vec<(String, String)>> {
     None
 }
 
@@ -485,16 +503,63 @@ fn reap_probe_child(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// Parse `"<marker><path>"` out of whatever else a profile printed. One
-/// trailing newline is stripped, interior whitespace is preserved, and the
-/// value must carry at least two colon-separated entries.
-#[cfg(unix)]
-fn extract_probe_path(payload: &str) -> Option<String> {
-    let start = payload.find(SHELL_PATH_MARKER)? + SHELL_PATH_MARKER.len();
-    let remainder = &payload[start..];
-    let end = remainder.find(['\r', '\n']).unwrap_or(remainder.len());
-    let value = remainder[..end].trim();
-    (!value.is_empty() && value.contains(':')).then(|| value.to_string())
+/// Parse the NUL-separated `KEY=VALUE` entries printed after the LAST
+/// `SHELL_ENV_MARKER`. Profile noise before the marker is dropped by the
+/// marker cut; a repeated marker means the last payload wins; noise trailing
+/// the payload (after the final NUL) is skipped as segments that name no
+/// variable. Values keep their `=` characters whole; segments that are empty
+/// or carry no `=` are skipped; a value may be empty (`KEY=`).
+///
+/// Returns `None` when the marker is missing or no usable entry follows it —
+/// the caller keeps the ambient environment in that case.
+fn extract_probe_env(payload: &str) -> Option<Vec<(String, String)>> {
+    let start = payload.rfind(SHELL_ENV_MARKER)? + SHELL_ENV_MARKER.len();
+    let mut vars = Vec::new();
+    for segment in payload[start..].split('\0') {
+        if segment.is_empty() {
+            continue; // consecutive NULs or the payload's trailing NUL
+        }
+        let Some((key, value)) = segment.split_once('=') else {
+            continue; // not an assignment — profile noise tail
+        };
+        if key.is_empty() {
+            continue; // "=value" names no variable
+        }
+        vars.push((key.to_string(), value.to_string()));
+    }
+    (!vars.is_empty()).then_some(vars)
+}
+
+/// The sidecar's child environment, layered: the ambient process environment
+/// is the base, every login-shell export wins over it (a profile's DSH_HOME,
+/// proxy, or provider settings must reach the sidecar exactly as a terminal
+/// launch sees them), and the app's mandated variables are applied last so a
+/// profile can never intercept the sidecar contract (the port handshake).
+/// Later layers win per key; keys no layer sets pass through from ambient.
+fn sidecar_env(
+    ambient: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    login: &[(String, String)],
+) -> std::collections::HashMap<String, String> {
+    let mut env: std::collections::HashMap<String, String> = ambient
+        .map(|(key, value)| {
+            (
+                key.to_string_lossy().into_owned(),
+                value.to_string_lossy().into_owned(),
+            )
+        })
+        .collect();
+    for (key, value) in login {
+        env.insert(key.clone(), value.clone());
+    }
+    env.insert("DSH_DESKTOP_PORT".to_string(), "0".to_string());
+    env
+}
+
+/// Value of one variable in a parsed probe payload.
+fn lookup_var<'a>(vars: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    vars.iter()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.as_str())
 }
 
 /// The `node` binary used when no runtime is bundled: searched along the
@@ -612,9 +677,103 @@ fn log_redacted(line: &str) {
 mod tests {
     use super::{parse_url_line, redact_token};
 
+    mod shell_env {
+        use super::super::{extract_probe_env, sidecar_env};
+
+        #[test]
+        fn extracts_entries_past_profile_startup_noise() {
+            let payload = "Last login: Fri Aug 26 on ttys000\nloading nvm...\
+                 \n__DSH_ENV__DSH_HOME=/Users/me/dsh\0HTTP_PROXY=http://127.0.0.1:7890\0PATH=/opt/homebrew/bin:/usr/bin\0";
+            assert_eq!(
+                extract_probe_env(payload),
+                Some(vec![
+                    ("DSH_HOME".to_string(), "/Users/me/dsh".to_string()),
+                    ("HTTP_PROXY".to_string(), "http://127.0.0.1:7890".to_string()),
+                    ("PATH".to_string(), "/opt/homebrew/bin:/usr/bin".to_string()),
+                ]),
+            );
+        }
+
+        #[test]
+        fn repeated_marker_means_the_last_payload_wins() {
+            let payload = "__DSH_ENV__STALE=1\0noise\n__DSH_ENV__FRESH=2\0";
+            assert_eq!(
+                extract_probe_env(payload),
+                Some(vec![("FRESH".to_string(), "2".to_string())]),
+            );
+        }
+
+        #[test]
+        fn values_keep_equals_signs_and_may_be_empty() {
+            let payload = "__DSH_ENV__EQ=a=b=c\0EMPTY=\0";
+            assert_eq!(
+                extract_probe_env(payload),
+                Some(vec![
+                    ("EQ".to_string(), "a=b=c".to_string()),
+                    ("EMPTY".to_string(), String::new()),
+                ]),
+            );
+        }
+
+        #[test]
+        fn skips_empty_and_garbage_segments() {
+            let payload = "__DSH_ENV__GOOD=1\0\0\0no_assignment\0=orphan_value\0TAIL=2\0trailing noise";
+            assert_eq!(
+                extract_probe_env(payload),
+                Some(vec![
+                    ("GOOD".to_string(), "1".to_string()),
+                    ("TAIL".to_string(), "2".to_string()),
+                ]),
+            );
+        }
+
+        #[test]
+        fn rejects_missing_marker_or_marker_without_entries() {
+            assert_eq!(extract_probe_env("profile printed nothing useful"), None);
+            assert_eq!(extract_probe_env("__DSH_ENV__"), None);
+            assert_eq!(extract_probe_env("__DSH_ENV__\0\0"), None);
+            assert_eq!(extract_probe_env("__DSH_ENV__nothing useful printed"), None);
+        }
+
+        /// A fixed ambient base so merge assertions never depend on the real
+        /// process environment.
+        fn ambient<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)> + 'a {
+            pairs
+                .iter()
+                .map(|(key, value)| ((*key).into(), (*value).into()))
+        }
+
+        #[test]
+        fn login_wins_ambient_only_is_kept_login_only_is_added() {
+            let env = sidecar_env(
+                ambient(&[("PATH", "/usr/bin"), ("AMBIENT_ONLY", "keep"), ("DSH_HOME", "/stub")]),
+                &[
+                    ("DSH_HOME".to_string(), "/Users/me/dsh".to_string()),
+                    ("HTTP_PROXY".to_string(), "http://127.0.0.1:7890".to_string()),
+                ],
+            );
+            assert_eq!(env.get("DSH_HOME").map(String::as_str), Some("/Users/me/dsh"), "login beats ambient");
+            assert_eq!(env.get("AMBIENT_ONLY").map(String::as_str), Some("keep"), "process-only survives");
+            assert_eq!(env.get("HTTP_PROXY").map(String::as_str), Some("http://127.0.0.1:7890"), "login-only is added");
+        }
+
+        #[test]
+        fn mandated_port_contract_beats_every_profile() {
+            let env = sidecar_env(
+                ambient(&[("DSH_DESKTOP_PORT", "4242")]),
+                &[("DSH_DESKTOP_PORT".to_string(), "9999".to_string())],
+            );
+            assert_eq!(
+                env.get("DSH_DESKTOP_PORT").map(String::as_str),
+                Some("0"),
+                "a profile must not intercept the sidecar port contract",
+            );
+        }
+    }
+
     #[cfg(unix)]
-    mod shell_path {
-        use super::super::{extract_probe_path, resolve_in_path};
+    mod path_lookup {
+        use super::super::resolve_in_path;
         use std::path::{Path, PathBuf};
 
         /// A unique scratch root that cleans itself up, safe under parallel runs.
@@ -647,35 +806,6 @@ mod tests {
             std::fs::write(path, "#!/bin/sh\n").expect("write fixture script");
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod fixture script");
-        }
-
-        #[test]
-        fn extracts_the_path_past_profile_startup_noise() {
-            let payload = "Last login: Fri Aug 26 on ttys000\nloading nvm...\n\
-                 __DSH_PATH__/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/me/.local/bin";
-            assert_eq!(
-                extract_probe_path(payload),
-                Some(
-                    "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/me/.local/bin"
-                        .to_string()
-                ),
-            );
-        }
-
-        #[test]
-        fn strips_a_single_trailing_newline_after_the_path() {
-            assert_eq!(
-                extract_probe_path("__DSH_PATH__/bin:/usr/bin\n"),
-                Some("/bin:/usr/bin".to_string()),
-            );
-        }
-
-        #[test]
-        fn rejects_missing_empty_or_componentless_probe_payloads() {
-            assert_eq!(extract_probe_path("profile printed nothing useful"), None);
-            assert_eq!(extract_probe_path("__DSH_PATH__"), None);
-            assert_eq!(extract_probe_path("__DSH_PATH__   \n"), None);
-            assert_eq!(extract_probe_path("__DSH_PATH__/only-one-directory"), None);
         }
 
         #[test]
