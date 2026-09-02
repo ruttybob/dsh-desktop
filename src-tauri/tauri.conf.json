@@ -27,6 +27,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": "all",
     "category": "DeveloperTool",
     "shortDescription": "DeepSeek Harness desktop client",
@@ -49,6 +50,14 @@
       "deb": {
         "depends": []
       }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDlENzFCOTk3NjRGNjM1RDUKUldUVk5mWmtsN2x4blIzaFlPTzNnemt2dFc2MHc3YUVaQmh4SHU2Wjg2YlZab3FFMVRYdU9mUjUK",
+      "endpoints": [
+        "https://github.com/ruttybob/dsh-desktop/releases/latest/download/latest.json"
+      ]
     }
   }
 }
