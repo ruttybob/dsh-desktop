@@ -481,9 +481,9 @@ fn restore_login_shell_env() -> Option<Vec<(String, String)>> {
     }
     let vars = extract_probe_env(&String::from_utf8_lossy(&captured))?;
     log::info!("[host] restored login-shell environment ({} vars)", vars.len());
-    // Names only, never values — and only at debug, so the default launch
-    // log carries the count alone.
-    log::debug!(
+    // Names only, never values — and only at trace, so even debug logs carry
+    // the count alone (the names alone reveal which secrets a machine holds).
+    log::trace!(
         "[host] login-shell environment names: {}",
         vars.iter().map(|(key, _)| key.as_str()).collect::<Vec<_>>().join(" ")
     );
