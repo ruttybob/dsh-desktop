@@ -192,6 +192,14 @@ fn navigate_through_cookie_proxy(url: &Url, window: &WebviewWindow) -> Result<()
             return Err(url.clone());
         }
     };
+    // The shell's one observable auth signal: a plain GET through the proxy
+    // must come back 200 (proxy injects the minted cookie, sidecar accepts
+    // it). The WebView cannot be trusted to report auth failures — a 401
+    // renders as a page and surfaces nothing — so this log line is the
+    // greppable proof the auth path works before the window is handed over.
+    if let Err(error) = verify_proxy_auth(proxy_port) {
+        log::warn!("[host] auth verification failed; continuing with proxied navigation: {error}");
+    }
     // The navigation target is the PROXY origin (same loopback host, proxy
     // port, clean root) — the proxy attaches the minted cookie to every
     // request it forwards to the sidecar.
@@ -204,6 +212,41 @@ fn navigate_through_cookie_proxy(url: &Url, window: &WebviewWindow) -> Result<()
             log::warn!("[host] proxied navigation failed: {error}");
             Err(url.clone())
         }
+    }
+}
+
+/// A plain GET of the proxy root must come back 200: the proxy injects the
+/// minted cookie and the sidecar validates it, so this one request proves the
+/// whole auth chain (dance, injection, rewrite, authority binding) before the
+/// window is handed over. Returns `Err` with the observed status line on any
+/// other answer.
+fn verify_proxy_auth(proxy_port: u16) -> Result<(), String> {
+    let mut stream = TcpStream::connect(("127.0.0.1", proxy_port))
+        .map_err(|error| format!("proxy connect failed: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|error| format!("read timeout setup failed: {error}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .map_err(|error| format!("write timeout setup failed: {error}"))?;
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .map_err(|error| format!("probe write failed: {error}"))?;
+    let mut raw = Vec::new();
+    stream
+        .take(16 * 1024)
+        .read_to_end(&mut raw)
+        .map_err(|error| format!("probe read failed: {error}"))?;
+    let status_line = String::from_utf8_lossy(&raw)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    if status_line.contains(" 200") {
+        log::info!("[host] auth path verified through proxy (200)");
+        Ok(())
+    } else {
+        Err(format!("unexpected answer: {status_line}"))
     }
 }
 
@@ -775,7 +818,7 @@ mod tests {
     }
 
     mod browser_session_cookie {
-        use super::super::{extract_set_cookie_pair, mint_browser_session_cookie};
+        use super::super::{extract_set_cookie_pair, mint_browser_session_cookie, verify_proxy_auth};
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use tauri::Url;
@@ -866,6 +909,34 @@ mod tests {
             });
             let url = Url::parse(&format!("http://127.0.0.1:{port}/?token=abc")).expect("url");
             assert!(mint_browser_session_cookie(&url).is_err());
+        }
+
+        /// A one-shot local server answering `status` to any single request.
+        fn serve_status(status: &'static str) -> u16 {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            let port = listener.local_addr().expect("local addr").port();
+            std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().expect("accept");
+                let mut buf = [0u8; 512];
+                let _ = socket.read(&mut buf);
+                let response = format!("{status}\r\ncontent-length: 0\r\n\r\n");
+                socket.write_all(response.as_bytes()).expect("write answer");
+                socket.shutdown(std::net::Shutdown::Write).expect("close");
+            });
+            port
+        }
+
+        #[test]
+        fn verification_passes_on_a_200_answer() {
+            let port = serve_status("HTTP/1.1 200 OK");
+            assert_eq!(verify_proxy_auth(port), Ok(()));
+        }
+
+        #[test]
+        fn verification_fails_loudly_on_a_non_200_answer() {
+            let port = serve_status("HTTP/1.1 401 Unauthorized");
+            let error = verify_proxy_auth(port).expect_err("must fail");
+            assert!(error.contains("401"), "{error}");
         }
     }
 
