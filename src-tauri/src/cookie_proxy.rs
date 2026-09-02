@@ -48,8 +48,8 @@ pub(crate) fn spawn(sidecar_port: u16, cookie_pair: String) -> Result<u16, Strin
 }
 
 fn handle(mut client: TcpStream, sidecar_port: u16, cookie_pair: String) {
-    let head = match read_head(&mut client) {
-        Some(head) => head,
+    let (head, leftover) = match read_head(&mut client) {
+        Some(split) => split,
         None => {
             log::warn!("[proxy] client closed before a complete request head");
             return;
@@ -65,6 +65,13 @@ fn handle(mut client: TcpStream, sidecar_port: u16, cookie_pair: String) {
     };
     let rewritten = rewrite_head(&head, &cookie_pair, &format!("127.0.0.1:{sidecar_port}"), is_upgrade);
     if upstream.write_all(&rewritten).is_err() {
+        return;
+    }
+    // Bytes read past the head belong to the request body (small POSTs ride
+    // in the client's first segment together with the head); they must reach
+    // the sidecar or its parser sees Content-Length with no body and answers
+    // a silent 400.
+    if !leftover.is_empty() && upstream.write_all(&leftover).is_err() {
         return;
     }
 
@@ -91,13 +98,15 @@ fn handle(mut client: TcpStream, sidecar_port: u16, cookie_pair: String) {
 }
 
 /// Read one request head: everything up to and including the first `\r\n\r\n`
-/// (capped). Returns `None` on EOF before a complete head or on overflow.
-fn read_head(stream: &mut TcpStream) -> Option<String> {
+/// (capped). Returns the head string plus any bytes read past it (the start
+/// of the request body — they belong to the upstream pipe, see `handle`).
+/// Returns `None` on EOF before a complete head or on overflow.
+fn read_head(stream: &mut TcpStream) -> Option<(String, Vec<u8>)> {
     let mut raw = Vec::new();
     let mut buf = [0u8; 1024];
     loop {
-        if raw.windows(4).any(|window| window == b"\r\n\r\n") {
-            return Some(String::from_utf8_lossy(&raw).into_owned());
+        if let Some(split) = split_head(&raw) {
+            return Some(split);
         }
         if raw.len() > 64 * 1024 {
             return None;
@@ -108,6 +117,15 @@ fn read_head(stream: &mut TcpStream) -> Option<String> {
         }
         raw.extend_from_slice(&buf[..read]);
     }
+}
+
+/// Split one captured request at its head terminator: the head (through and
+/// including the first `\r\n\r\n`) and the bytes after it. `None` while the
+/// terminator has not arrived.
+fn split_head(raw: &[u8]) -> Option<(String, Vec<u8>)> {
+    let position = raw.windows(4).position(|window| window == b"\r\n\r\n")?;
+    let (head, rest) = raw.split_at(position + 4);
+    Some((String::from_utf8_lossy(head).into_owned(), rest.to_vec()))
 }
 
 fn is_upgrade_request(head: &str) -> bool {
@@ -185,7 +203,32 @@ fn rewrite_head(
 
 #[cfg(test)]
 mod tests {
-    use super::rewrite_head;
+    use super::{rewrite_head, split_head};
+
+    #[test]
+    fn split_keeps_head_and_hands_body_bytes_to_the_pipe() {
+        let head = "POST /api/x HTTP/1.1\r\nHost: 127.0.0.1:55687\r\nContent-Length: 5\r\n\r\n";
+        let raw = format!("{head}hello");
+        let (parsed, leftover) = split_head(raw.as_bytes()).expect("complete head");
+        assert_eq!(parsed, head);
+        assert_eq!(leftover, b"hello");
+    }
+
+    #[test]
+    fn splits_at_the_first_terminator_only() {
+        // A JSON body may carry sequences resembling head terminators; the
+        // first terminator ends the head, everything after is body.
+        let raw = b"POST /api/x HTTP/1.1\r\nHost: h\r\n\r\n{\"a\": \"\r\n\r\nb\"}";
+        let (parsed, leftover) = split_head(raw).expect("complete head");
+        assert_eq!(parsed, "POST /api/x HTTP/1.1\r\nHost: h\r\n\r\n");
+        assert_eq!(leftover, b"{\"a\": \"\r\n\r\nb\"}");
+    }
+
+    #[test]
+    fn rejects_a_head_without_its_terminator() {
+        assert!(split_head(b"POST /api/x HTTP/1.1\r\nHost: h\r\n").is_none());
+        assert!(split_head(b"").is_none());
+    }
 
     #[test]
     fn injects_the_cookie_pins_host_and_forces_close_on_plain_requests() {
