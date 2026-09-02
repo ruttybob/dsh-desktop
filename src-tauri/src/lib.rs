@@ -15,6 +15,14 @@ use tauri::Manager;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tauri_plugin_updater::UpdaterExt;
 
+/// One shared way to stop the sidecar (stop() is idempotent): both exit
+/// paths and the updater's accepted-update path go through here.
+fn stop_sidecar(app: &tauri::AppHandle) {
+    if let Some(manager) = app.try_state::<host::HostManager>() {
+        manager.stop();
+    }
+}
+
 /// Background update check at launch (dsh-3r8): check → confirm dialog →
 /// download+install → restart. Spawned onto the async runtime, never the
 /// main thread (`blocking_show` and the updater's blocking download would
@@ -67,12 +75,6 @@ fn spawn_update_check(app: tauri::AppHandle) {
             log::info!("[update] postponed by the user");
             return;
         }
-        // The install replaces the .app bundle the sidecar runs from; stop
-        // it first (idempotent — the exit-path handlers below see it gone).
-        // The restarted process spawns a fresh sidecar of the new version.
-        if let Some(manager) = app.try_state::<host::HostManager>() {
-            manager.stop();
-        }
         log::info!("[update] downloading v{}", update.version);
         match update
             .download_and_install(
@@ -83,6 +85,13 @@ fn spawn_update_check(app: tauri::AppHandle) {
         {
             Ok(()) => {
                 log::info!("[update] installed v{}; restarting", update.version);
+                // Only now stop the sidecar: a failed download or install
+                // must leave the running harness untouched. The restarted
+                // process spawns a fresh sidecar of the new version; the
+                // install replaces the bundle the old one ran from (a
+                // running process keeps its unlinked inodes, so stopping
+                // this late is safe on Unix).
+                stop_sidecar(&app);
                 app.restart();
             }
             Err(e) => log::warn!("[update] download/install failed: {e}"),
@@ -144,14 +153,10 @@ pub fn run() {
             match event {
                 tauri::RunEvent::ExitRequested { .. } => {
                     log::info!("[launch] exit requested; stopping sidecar");
-                    if let Some(manager) = app_handle.try_state::<host::HostManager>() {
-                        manager.stop();
-                    }
+                    stop_sidecar(app_handle);
                 }
                 tauri::RunEvent::Exit => {
-                    if let Some(manager) = app_handle.try_state::<host::HostManager>() {
-                        manager.stop();
-                    }
+                    stop_sidecar(app_handle);
                 }
                 _ => {}
             }
