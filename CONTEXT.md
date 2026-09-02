@@ -26,7 +26,7 @@ The transient placeholder shown while the [sidecar host](#sidecar-host) boots; i
 _Avoid_: splash screen, welcome screen, connect form.
 
 ### Command palette
-The Cmd+K overlay: one filterable list grouping a few commands and every live session; picking a session jumps to it. Its key bindings are remappable from inside the palette itself. It coexists with the composer's slash-command menu — opening one never force-closes the other.
+The Cmd+K overlay: two tabbed views — **Actions** (commands and the model/effort/agent picks) and **Sessions** (every live session, the current one marked); Tab cycles the views, the palette opens on Sessions, and picking a session jumps to it. Its key bindings are remappable from inside the palette itself. It coexists with the composer's slash-command menu — opening one never force-closes the other.
 
 ### Update check
 The background probe the shell runs at launch (`[update]` log prefix, `src-tauri/src/lib.rs`): it asks the release feed (`latest.json` on the fork's GitHub releases), and on a newer version shows a blocking Restart/Later dialog — accepting downloads and installs the signed bundle and restarts the shell. Every failure (offline, no release yet, rate limits, declined dialog) is a logged warning only; launch never waits on it and the running [sidecar host](#sidecar-host) is never taken down by a failed update.
