@@ -18,6 +18,7 @@ _Avoid_: auth token, API token, fixed token.
 
 ### Browser-session cookie
 The signed, authority-bound cookie a dsh web server mints on a successful [launch-token](#launch-token) exchange. The sidecar's port is OS-assigned, so the authority changes every launch: a cookie is minted fresh at each launch from the ready-line token, and none survives across launches.
+The dance's reference implementation is `scripts/smoke-host.mjs` (server side: harness `packages/client/connection/src/browser-auth.ts`). WebKit never sends this cookie back — the shell mints it in Rust and fronts the sidecar with `src-tauri/src/cookie_proxy.rs`, which attaches it to every request and rewrites Host/Origin/Referer to the sidecar authority (the cookie name and signed payload hash the authority).
 _Avoid_: session token, login cookie.
 
 ### Loading screen
